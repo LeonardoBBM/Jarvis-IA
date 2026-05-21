@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json, os, signal, subprocess, sys, time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -14,14 +15,20 @@ except Exception:
     OPENWAKEWORD_AVAILABLE = False
 
 VOSK_MODEL_DIR = Path('/home/leonardo/.local/share/oye-jarvis/models/vosk-model-small-es-0.42')
-JARVIS_VOZ = '/home/leonardo/.local/bin/jarvis-voz'
-JARVIS_STOP = '/home/leonardo/.local/bin/jarvis-stop'
-ARECORD = '/usr/bin/arecord'
-AMIXER = '/usr/bin/amixer'
+JARVIS_VOZ   = '/home/leonardo/.local/bin/jarvis-voz'
+JARVIS_STOP  = '/home/leonardo/.local/bin/jarvis-stop'
+ARECORD      = '/usr/bin/arecord'
+AMIXER       = '/usr/bin/amixer'
 SPEAKING_LOCK = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp')) / 'jarvis-voz' / 'speaking.lock'
-# Sensibilidad del wake word. Más alto = menos falsos positivos.
-OPENWAKEWORD_THRESHOLD = 0.60
-REQUIRE_VOSK_OYE = True
+
+# OpenWakeWord: score ≥ HIGH_THRESHOLD dispara inmediatamente;
+# entre THRESHOLD y HIGH_THRESHOLD requiere confirmación de Vosk (REQUIRE_VOSK_OYE).
+OPENWAKEWORD_THRESHOLD      = 0.60
+OPENWAKEWORD_HIGH_THRESHOLD = 0.85
+REQUIRE_VOSK_OYE            = True   # ahora sí se usa: confirmación secundaria para OWW borderline
+
+# Cuántos chunks de Vosk guardamos para buscar confirmación retrospectiva.
+VOSK_HISTORY_CHUNKS = 6   # ~480 ms de audio
 
 running = True
 
@@ -33,17 +40,24 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 
 WAKE_GRAMMAR = [
-    # Wake word + comandos frecuentes. Esto permite ejecutar “Oye Jarvis, pon volumen al 30”
-    # sin abrir una segunda ventana de escucha.
     'oye jarvis', 'oye llaves', 'oye llave', 'jarvis',
-    'oye jarvis para', 'oye jarvis detente', 'oye jarvis cancela', 'oye jarvis silencio', 'oye jarvis callate',
-    'jarvis para', 'jarvis detente', 'jarvis cancela', 'jarvis silencio', 'jarvis callate',
-    'oye jarvis pon volumen al treinta', 'oye jarvis pon volumen al cincuenta', 'oye jarvis pon volumen al cien',
-    'oye jarvis sube volumen', 'oye jarvis baja volumen', 'oye jarvis sube tantito', 'oye jarvis baja tantito',
-    'oye jarvis abre youtube', 'oye jarvis abre firefox', 'oye jarvis abre descargas', 'oye jarvis abre escritorio',
+    'oye jarvis para', 'oye jarvis detente', 'oye jarvis cancela',
+    'oye jarvis silencio', 'oye jarvis callate',
+    'jarvis para', 'jarvis detente', 'jarvis cancela',
+    'jarvis silencio', 'jarvis callate',
+    # Volumen rápido
+    'oye jarvis pon volumen al treinta', 'oye jarvis pon volumen al cincuenta',
+    'oye jarvis pon volumen al cien', 'oye jarvis sube volumen',
+    'oye jarvis baja volumen', 'oye jarvis sube tantito', 'oye jarvis baja tantito',
+    # Apps frecuentes
+    'oye jarvis abre youtube', 'oye jarvis abre firefox',
+    'oye jarvis abre descargas', 'oye jarvis abre escritorio',
+    # Consultas frecuentes
     'oye jarvis que hora es', 'oye jarvis como estas', 'oye jarvis gracias',
-    'cero', 'uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete', 'ocho', 'nueve', 'diez',
-    'veinte', 'treinta', 'cuarenta', 'cincuenta', 'sesenta', 'setenta', 'ochenta', 'noventa', 'cien',
+    # Números sueltos (para comandos inline de volumen)
+    'cero', 'uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete',
+    'ocho', 'nueve', 'diez', 'veinte', 'treinta', 'cuarenta', 'cincuenta',
+    'sesenta', 'setenta', 'ochenta', 'noventa', 'cien',
     '[unk]'
 ]
 
@@ -60,19 +74,35 @@ def norm(s):
 def stop_detected_vosk(text):
     t = norm(text)
     compact = ''.join(ch for ch in t if ch.isalnum())
-    has_name = any(x in t for x in ['jarvis', 'llave', 'llaves']) or any(x in compact for x in ['jarvis','llave','llaves'])
-    has_stop = any(x in t for x in ['para', 'detente', 'cancela', 'cancelar', 'silencio', 'callate', 'alto', 'stop'])
+    has_name = (
+        any(x in t for x in ['jarvis', 'llave', 'llaves'])
+        or any(x in compact for x in ['jarvis', 'llave', 'llaves'])
+    )
+    has_stop = any(x in t for x in [
+        'para', 'detente', 'cancela', 'cancelar', 'silencio',
+        'callate', 'alto', 'stop', 'basta', 'olvida', 'olvidalo',
+    ])
     return has_name and has_stop
 
 def wake_detected_vosk(text):
     t = norm(text)
     compact = ''.join(ch for ch in t if ch.isalnum())
-    variants = ['oye jarvis','oye llaves','oye llave']
-    if any(v in t for v in variants): return True
-    if 'oye' in t and any(x in t for x in ['jarvis','llave','llaves']): return True
-    return any(v in compact for v in ['oyejarvis','oyellaves','oyellave'])
+    variants = ['oye jarvis', 'oye llaves', 'oye llave']
+    if any(v in t for v in variants):
+        return True
+    if 'oye' in t and any(x in t for x in ['jarvis', 'llave', 'llaves']):
+        return True
+    return any(v in compact for v in ['oyejarvis', 'oyellaves', 'oyellave'])
+
+def vosk_history_has_wake(history_deque):
+    """Comprueba si algún texto reciente del buffer contiene wake word."""
+    for txt in history_deque:
+        if wake_detected_vosk(txt):
+            return True
+    return False
 
 def inline_command_from_wake(text):
+    """Extrae el comando que sigue al wake word, si lo hay."""
     t = norm(text)
     for prefix in ['oye jarvis', 'oye llaves', 'oye llave']:
         if t.startswith(prefix):
@@ -81,117 +111,193 @@ def inline_command_from_wake(text):
     return ''
 
 def start_recorder():
-    # No pausamos durante TTS: así “Jarvis, para/detente” puede cortar la voz actual.
-    # La activación normal sigue exigiendo wake word para evitar falsos positivos.
-    _ = SPEAKING_LOCK.exists()
     if os.path.exists(AMIXER):
-        subprocess.run([AMIXER, '-q', 'set', 'Capture', '30%', 'cap'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return subprocess.Popen([ARECORD, '-q', '-f', 'S16_LE', '-r', '16000', '-c', '1', '-t', 'raw'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            [AMIXER, '-q', 'set', 'Capture', '30%', 'cap'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    return subprocess.Popen(
+        [ARECORD, '-q', '-f', 'S16_LE', '-r', '16000', '-c', '1', '-t', 'raw'],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
 
 def stop_recorder(proc):
-    if not proc: return
+    if not proc:
+        return
     try:
-        proc.terminate(); proc.wait(timeout=1.5)
+        proc.terminate()
+        proc.wait(timeout=1.5)
     except Exception:
-        try: proc.kill()
-        except Exception: pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 def trigger(reason, proc, vosk_model, wake_model, stop_cmd=False, inline_text=''):
     if inline_text:
-        print(f'Activado por: {reason} | comando inline: {inline_text}', flush=True)
+        print(f'Activado: {reason} | inline: {inline_text}', flush=True)
     else:
-        print(f'Activado por: {reason}', flush=True)
+        print(f'Activado: {reason}', flush=True)
     stop_recorder(proc)
     try:
         if stop_cmd and os.path.exists(JARVIS_STOP):
-            subprocess.run([JARVIS_STOP], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            subprocess.run(
+                [JARVIS_STOP],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
+            )
         else:
             env = os.environ.copy()
             if inline_text:
                 env['JARVIS_PREFILLED_TEXT'] = inline_text
-            subprocess.run([JARVIS_VOZ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240, env=env)
+            subprocess.run(
+                [JARVIS_VOZ],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=240, env=env,
+            )
     except subprocess.TimeoutExpired:
-        print('jarvis-stop timeout' if stop_cmd else 'jarvis-voz timeout', flush=True)
+        print('timeout: ' + ('jarvis-stop' if stop_cmd else 'jarvis-voz'), flush=True)
     except Exception as exc:
-        print(f'Error ejecutando {"jarvis-stop" if stop_cmd else "jarvis-voz"}: {exc}', flush=True)
+        print(f'Error: {exc}', flush=True)
     if wake_model:
-        try: wake_model.reset()
-        except Exception: pass
+        try:
+            wake_model.reset()
+        except Exception:
+            pass
     time.sleep(0.4)
     return start_recorder(), new_vosk_recognizer(vosk_model)
 
+# ── Bootstrap ─────────────────────────────────────────────────────────────────
+
 if not VOSK_MODEL_DIR.exists():
-    print(f'Modelo Vosk no encontrado: {VOSK_MODEL_DIR}', file=sys.stderr); sys.exit(1)
+    print(f'Modelo Vosk no encontrado: {VOSK_MODEL_DIR}', file=sys.stderr)
+    sys.exit(1)
 
 vosk_model = VoskModel(str(VOSK_MODEL_DIR))
-rec = new_vosk_recognizer(vosk_model)
+rec        = new_vosk_recognizer(vosk_model)
 wake_model = None
+
 if OPENWAKEWORD_AVAILABLE:
     try:
-        root = Path(openwakeword.__file__).parent
+        root       = Path(openwakeword.__file__).parent
         hey_jarvis = root / 'resources' / 'models' / 'hey_jarvis_v0.1.onnx'
-        wake_model = WakeModel(wakeword_model_paths=[str(hey_jarvis)], enable_speex_noise_suppression=False)
+        wake_model = WakeModel(
+            wakeword_model_paths=[str(hey_jarvis)],
+            enable_speex_noise_suppression=False,
+        )
         print('OpenWakeWord activo: hey_jarvis', flush=True)
     except Exception as exc:
-        print(f'OpenWakeWord no disponible, usando Vosk: {exc}', flush=True)
+        print(f'OpenWakeWord no disponible, solo Vosk: {exc}', flush=True)
         wake_model = None
 
 print('Jarvis escucha activo. Di: oye Jarvis', flush=True)
-proc = start_recorder()
-last_trigger = 0
+
+proc         = start_recorder()
+last_trigger = 0.0
+# Buffer circular con los últimos textos reconocidos por Vosk (para confirmación OWW borderline).
+vosk_history: deque = deque(maxlen=VOSK_HISTORY_CHUNKS)
+# Ventana de tiempo en que esperamos confirmación Vosk tras OWW borderline.
+oww_pending_until = 0.0
+
 try:
     while running:
-        data = proc.stdout.read(2560) if proc and proc.stdout else b''  # 1280 samples = 80 ms
+        # ── leer audio ────────────────────────────────────────────────────────
+        if proc and proc.stdout:
+            data = proc.stdout.read(2560)   # 1280 samples = 80 ms
+        else:
+            data = b''
+
         if not data:
+            # arecord murió o no hay datos: pequeña pausa para no quemar CPU.
             time.sleep(0.03)
             if proc and proc.poll() is not None:
+                print('arecord terminó inesperadamente, reiniciando…', flush=True)
                 proc = start_recorder()
             continue
 
+        # ── Vosk ──────────────────────────────────────────────────────────────
         should_trigger = False
-        stop_cmd = False
-        reason = ''
-        inline_text = ''
+        stop_cmd       = False
+        reason         = ''
+        inline_text    = ''
 
-        # Vosk se revisa primero para que “Jarvis, para/cállate” tenga prioridad
-        # incluso si OpenWakeWord también detecta el nombre mientras Jarvis habla.
         texts = []
         if rec.AcceptWaveform(data):
-            try: texts.append(json.loads(rec.Result()).get('text', ''))
-            except Exception: pass
+            try:
+                texts.append(json.loads(rec.Result()).get('text', ''))
+            except Exception:
+                pass
         else:
-            try: texts.append(json.loads(rec.PartialResult()).get('partial', ''))
-            except Exception: pass
+            try:
+                texts.append(json.loads(rec.PartialResult()).get('partial', ''))
+            except Exception:
+                pass
+
         for text in texts:
-            if not text: continue
+            if not text:
+                continue
             if text not in {'[unk]', ''}:
                 print(f'Oído: {text}', flush=True)
+            vosk_history.append(norm(text))
+
             if stop_detected_vosk(text):
                 should_trigger = True
-                stop_cmd = True
-                reason = f'stop: {text}'
+                stop_cmd       = True
+                reason         = f'stop: {text}'
                 break
             if wake_detected_vosk(text):
                 should_trigger = True
-                reason = text
-                inline_text = inline_command_from_wake(text)
+                reason         = text
+                inline_text    = inline_command_from_wake(text)
                 break
 
-        # Detector dedicado: rápido y más fiable con “Jarvis”.
-        if not should_trigger and wake_model is not None:
+        # ── OpenWakeWord ──────────────────────────────────────────────────────
+        # NUNCA activamos OWW si Jarvis está hablando (evita auto-activación).
+        # Solo los stop commands de Vosk siguen funcionando durante TTS.
+        if not should_trigger and wake_model is not None and not SPEAKING_LOCK.exists():
             try:
                 audio = np.frombuffer(data, dtype=np.int16)
-                pred = wake_model.predict(audio)
+                pred  = wake_model.predict(audio)
                 score = max(float(v) for v in pred.values()) if pred else 0.0
-                if score >= OPENWAKEWORD_THRESHOLD:
+
+                if score >= OPENWAKEWORD_HIGH_THRESHOLD:
+                    # Confianza alta → dispara sin confirmación adicional.
                     should_trigger = True
-                    reason = f'openwakeword score={score:.2f}'
+                    reason         = f'oww score={score:.2f}'
+                elif score >= OPENWAKEWORD_THRESHOLD:
+                    if REQUIRE_VOSK_OYE:
+                        # Confianza borderline: marcamos ventana de confirmación.
+                        # Si Vosk ya confirmó en el buffer reciente, dispara ya.
+                        if vosk_history_has_wake(vosk_history):
+                            should_trigger = True
+                            reason         = f'oww+vosk score={score:.2f}'
+                        else:
+                            # Esperamos hasta VOSK_HISTORY_CHUNKS chunks más (~480 ms).
+                            oww_pending_until = time.time() + 0.5
+                            print(f'OWW borderline ({score:.2f}), esperando confirmación Vosk…', flush=True)
+                    else:
+                        should_trigger = True
+                        reason         = f'oww score={score:.2f}'
             except Exception as exc:
                 print(f'openwakeword error: {exc}', flush=True)
                 wake_model = None
 
+        # Confirmación Vosk diferida para OWW borderline.
+        if not should_trigger and oww_pending_until and time.time() < oww_pending_until:
+            if vosk_history_has_wake(vosk_history):
+                should_trigger    = True
+                reason            = 'oww+vosk (diferido)'
+                oww_pending_until = 0.0
+        elif time.time() >= oww_pending_until:
+            oww_pending_until = 0.0   # ventana expirada, descartamos
+
+        # ── Disparar ──────────────────────────────────────────────────────────
         if should_trigger and time.time() - last_trigger > 4:
             last_trigger = time.time()
-            proc, rec = trigger(reason, proc, vosk_model, wake_model, stop_cmd=stop_cmd, inline_text=inline_text)
+            vosk_history.clear()
+            proc, rec = trigger(
+                reason, proc, vosk_model, wake_model,
+                stop_cmd=stop_cmd, inline_text=inline_text,
+            )
+
 finally:
     stop_recorder(proc)

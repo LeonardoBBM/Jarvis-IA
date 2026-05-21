@@ -1,0 +1,7 @@
+{
+  "name": "The Freestyle Leo",
+  "ip": "192.168.1.xxx",
+  "port": 8002,
+  "token": "REEMPLAZAR_EN_CONFIG_LOCAL",
+  "secure": true
+}

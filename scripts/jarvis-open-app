@@ -6,7 +6,8 @@ HOME = Path.home()
 
 def norm(s):
     s = s.lower().strip()
-    s = ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    s = ''.join(c for c in unicodedata.normalize('NFD', s)
+                if unicodedata.category(c) != 'Mn')
     s = re.sub(r'[^a-z0-9 +#./:-]+', ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
 
@@ -17,16 +18,18 @@ def popen(cmd):
     subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 text = ' '.join(sys.argv[1:]).strip()
-q = norm(text)
+q    = norm(text)
 # Quita cortesía y ruido.
 q = re.sub(r'\b(por favor|en pantalla|ahora|para mi)\b', '', q).strip()
 
-m = re.search(r'\b(?:abre|abrir|abra|obra|ejecuta|inicia|lanza|busca|buscar|pon|reproduce)\b\s+(?:el |la |los |las |un |una |programa |aplicacion |app |pagina |sitio )?(.*)$', q)
+m = re.search(
+    r'\b(?:abre|abrir|abra|obra|ejecuta|inicia|lanza|busca|buscar|pon|reproduce|googlea|google)\b'
+    r'\s+(?:el |la |los |las |un |una |programa |aplicacion |app |pagina |sitio |web )?(.*)$', q)
 target = m.group(1).strip() if m else q
 if not target:
     sys.exit(2)
 
-FIREFOX = '/usr/bin/firefox'
+FIREFOX  = '/usr/bin/firefox'
 XDG_OPEN = '/usr/bin/xdg-open'
 
 def open_url(name, url):
@@ -45,19 +48,30 @@ def search_url(engine, query):
         return f'https://www.google.com/search?q={quoted}'
     if engine == 'spotify':
         return f'https://open.spotify.com/search/{urllib.parse.quote(query)}'
+    if engine == 'maps':
+        return f'https://www.google.com/maps/search/{urllib.parse.quote_plus(query)}'
     return f'https://www.google.com/search?q={quoted}'
 
 
-# Patrones sobre frase completa antes de recortar el verbo.
+# ── Patrones completos (sobre la frase antes de extraer el verbo) ─────────────
 full_patterns = [
-    (r'(?:abre |abrir |abra |obra )?youtube(?: y)? (?:busca|buscar|pon|reproduce)\s+(.+)', 'youtube', 'YouTube'),
-    (r'(?:busca|buscar) (?:en )?youtube\s+(.+)', 'youtube', 'YouTube'),
-    (r'(?:busca|buscar) (?:en )?google\s+(.+)', 'google', 'Google'),
-    (r'(?:googlea|google)\s+(.+)', 'google', 'Google'),
+    (r'(?:abre |abrir |abra |obra )?youtube(?: y)? (?:busca|buscar|pon|reproduce)\s+(.+)',
+     'youtube', 'YouTube'),
+    (r'(?:busca|buscar) (?:en )?youtube\s+(.+)',  'youtube', 'YouTube'),
+    (r'(?:busca|buscar) (?:en )?google\s+(.+)',   'google',  'Google'),
+    (r'(?:googlea|google)\s+(.+)',                'google',  'Google'),
+    (r'(?:busca|buscar) (?:en )?maps?\s+(.+)',    'maps',    'Google Maps'),
     (r'(?:pon|reproduce) musica(?: para)?\s*(.*)', 'youtube', 'música en YouTube'),
-    (r'musica(?: para)?\s*(.*)', 'youtube', 'música en YouTube'),
-    (r'(?:pon|reproduce)\s+(.+)', 'youtube', 'YouTube'),
+    (r'musica(?: para)?\s*(.*)',                   'youtube', 'música en YouTube'),
+    (r'(?:pon|reproduce)\s+(.+)',                  'youtube', 'YouTube'),
 ]
+
+BASE_URLS = {
+    'youtube': 'https://www.youtube.com',
+    'google':  'https://www.google.com',
+    'spotify': 'https://open.spotify.com',
+    'maps':    'https://www.google.com/maps',
+}
 
 def prehandle_full_phrase(q):
     for rx, engine, label in full_patterns:
@@ -67,25 +81,27 @@ def prehandle_full_phrase(q):
             if query:
                 open_url(label, search_url(engine, query))
             else:
-                base = {'youtube':'https://www.youtube.com', 'google':'https://www.google.com', 'spotify':'https://open.spotify.com'}[engine]
-                open_url(label, base)
+                open_url(label, BASE_URLS.get(engine, 'https://www.google.com'))
             return True
     return False
 
 if prehandle_full_phrase(q):
     sys.exit(0)
 
-# Patrones inteligentes de búsqueda/reproducción.
+# ── Patrones de búsqueda/reproducción sobre `target` ─────────────────────────
 patterns = [
-    (r'(?:abre |abrir |abra |obra )?youtube (?:y )?(?:busca|buscar|pon|reproduce)?\s*(.*)', 'youtube', 'YouTube'),
-    (r'(?:busca|buscar) (?:en )?youtube\s+(.*)', 'youtube', 'YouTube'),
-    (r'(?:busca|buscar) (?:en )?google\s+(.*)', 'google', 'Google'),
-    (r'en google\s+(.*)', 'google', 'Google'),
-    (r'(?:googlea|google)\s+(.*)', 'google', 'Google'),
+    (r'(?:abre |abrir |abra |obra )?youtube (?:y )?(?:busca|buscar|pon|reproduce)?\s*(.*)',
+     'youtube', 'YouTube'),
+    (r'(?:busca|buscar) (?:en )?youtube\s+(.*)',  'youtube', 'YouTube'),
+    (r'(?:busca|buscar) (?:en )?google\s+(.*)',   'google',  'Google'),
+    (r'(?:busca|buscar) (?:en )?maps?\s+(.*)',     'maps',    'Google Maps'),
+    (r'en google\s+(.*)',                          'google',  'Google'),
+    (r'(?:googlea|google)\s+(.*)',                 'google',  'Google'),
     (r'(?:pon|reproduce) musica(?: para)?\s*(.*)', 'youtube', 'música en YouTube'),
-    (r'musica(?: para)?\s*(.*)', 'youtube', 'música en YouTube'),
-    (r'(?:pon|reproduce)\s+(.*)', 'youtube', 'YouTube'),
-    (r'(?:abre |abrir |abra |obra )?spotify (?:y )?(?:busca|buscar|pon|reproduce)?\s*(.*)', 'spotify', 'Spotify'),
+    (r'musica(?: para)?\s*(.*)',                   'youtube', 'música en YouTube'),
+    (r'(?:pon|reproduce)\s+(.*)',                  'youtube', 'YouTube'),
+    (r'(?:abre |abrir |abra |obra )?spotify (?:y )?(?:busca|buscar|pon|reproduce)?\s*(.*)',
+     'spotify', 'Spotify'),
 ]
 for rx, engine, label in patterns:
     mm = re.fullmatch(rx, target)
@@ -94,151 +110,218 @@ for rx, engine, label in patterns:
         if query:
             open_url(label, search_url(engine, query))
         else:
-            base = {'youtube':'https://www.youtube.com', 'google':'https://www.google.com', 'spotify':'https://open.spotify.com'}[engine]
-            open_url(label, base)
+            open_url(label, BASE_URLS.get(engine, 'https://www.google.com'))
         sys.exit(0)
 
+# ── Sitios web ────────────────────────────────────────────────────────────────
+# IMPORTANTE: el match se hace con palabra completa para evitar falsos positivos
+# (e.g. "am" no debe abrir Amazon).
 sites = {
-    'youtube': ('YouTube', 'https://www.youtube.com'),
-    'you tube': ('YouTube', 'https://www.youtube.com'),
-    'netflix': ('Netflix', 'https://www.netflix.com'),
-    'whatsapp': ('WhatsApp Web', 'https://web.whatsapp.com'),
-    'whatsapp web': ('WhatsApp Web', 'https://web.whatsapp.com'),
-    'gmail': ('Gmail', 'https://mail.google.com'),
-    'correo': ('Gmail', 'https://mail.google.com'),
-    'drive': ('Google Drive', 'https://drive.google.com'),
-    'google drive': ('Google Drive', 'https://drive.google.com'),
-    'classroom': ('Google Classroom', 'https://classroom.google.com'),
-    'chatgpt': ('ChatGPT', 'https://chatgpt.com'),
-    'chat gpt': ('ChatGPT', 'https://chatgpt.com'),
-    'github': ('GitHub', 'https://github.com'),
-    'spotify': ('Spotify', 'https://open.spotify.com'),
-    'facebook': ('Facebook', 'https://www.facebook.com'),
-    'instagram': ('Instagram', 'https://www.instagram.com'),
-    'tiktok': ('TikTok', 'https://www.tiktok.com'),
-    'twitch': ('Twitch', 'https://www.twitch.tv'),
-    'amazon': ('Amazon', 'https://www.amazon.com.mx'),
-    'mercado libre': ('Mercado Libre', 'https://www.mercadolibre.com.mx'),
+    'youtube':        ('YouTube',           'https://www.youtube.com'),
+    'you tube':       ('YouTube',           'https://www.youtube.com'),
+    'netflix':        ('Netflix',           'https://www.netflix.com'),
+    'whatsapp':       ('WhatsApp Web',      'https://web.whatsapp.com'),
+    'whatsapp web':   ('WhatsApp Web',      'https://web.whatsapp.com'),
+    'gmail':          ('Gmail',             'https://mail.google.com'),
+    'correo':         ('Gmail',             'https://mail.google.com'),
+    'mi correo':      ('Gmail',             'https://mail.google.com'),
+    'drive':          ('Google Drive',      'https://drive.google.com'),
+    'google drive':   ('Google Drive',      'https://drive.google.com'),
+    'classroom':      ('Google Classroom',  'https://classroom.google.com'),
+    'chatgpt':        ('ChatGPT',           'https://chatgpt.com'),
+    'chat gpt':       ('ChatGPT',           'https://chatgpt.com'),
+    'claude':         ('Claude',            'https://claude.ai'),
+    'claude ai':      ('Claude',            'https://claude.ai'),
+    'github':         ('GitHub',            'https://github.com'),
+    'spotify':        ('Spotify',           'https://open.spotify.com'),
+    'facebook':       ('Facebook',          'https://www.facebook.com'),
+    'instagram':      ('Instagram',         'https://www.instagram.com'),
+    'tiktok':         ('TikTok',            'https://www.tiktok.com'),
+    'twitch':         ('Twitch',            'https://www.twitch.tv'),
+    'twitter':        ('Twitter / X',       'https://x.com'),
+    'x':              ('Twitter / X',       'https://x.com'),
+    'reddit':         ('Reddit',            'https://www.reddit.com'),
+    'linkedin':       ('LinkedIn',          'https://www.linkedin.com'),
+    'amazon':         ('Amazon',            'https://www.amazon.com.mx'),
+    'mercado libre':  ('Mercado Libre',     'https://www.mercadolibre.com.mx'),
+    'maps':           ('Google Maps',       'https://www.google.com/maps'),
+    'google maps':    ('Google Maps',       'https://www.google.com/maps'),
+    'traductor':      ('Google Translate',  'https://translate.google.com'),
+    'translate':      ('Google Translate',  'https://translate.google.com'),
+    'google translate':('Google Translate', 'https://translate.google.com'),
+    'meet':           ('Google Meet',       'https://meet.google.com'),
+    'google meet':    ('Google Meet',       'https://meet.google.com'),
+    'calendar':       ('Google Calendar',   'https://calendar.google.com'),
+    'google calendar':('Google Calendar',   'https://calendar.google.com'),
+    'calendario google':('Google Calendar', 'https://calendar.google.com'),
 }
+
 if target.startswith(('http://', 'https://')):
-    open_url(target, target); sys.exit(0)
-for key, (name, url) in sites.items():
-    if key in target or target in key:
-        open_url(name, url); sys.exit(0)
+    open_url(target, target)
+    sys.exit(0)
+
+# Búsqueda con coincidencia exacta primero, luego por palabras completas.
+def site_match(t, key):
+    """True si t == key o key aparece como palabra completa dentro de t."""
+    if t == key:
+        return True
+    # Palabra completa: key rodeado de inicio/fin de cadena o espacio.
+    return bool(re.search(r'(^|\s)' + re.escape(key) + r'($|\s)', t))
+
+for key, (name, url) in sorted(sites.items(), key=lambda x: -len(x[0])):
+    if site_match(target, key):
+        open_url(name, url)
+        sys.exit(0)
+
 if target in {'navegador', 'firefox', 'mozilla'}:
-    open_url('Firefox', 'about:home'); sys.exit(0)
+    open_url('Firefox', 'about:home')
+    sys.exit(0)
 if target == 'google':
-    open_url('Google', 'https://www.google.com'); sys.exit(0)
+    open_url('Google', 'https://www.google.com')
+    sys.exit(0)
 
 
-# Carpetas y archivos comunes.
+# ── Carpetas y archivos ───────────────────────────────────────────────────────
 folder_aliases = {
-    'escritorio': HOME / 'Escritorio',
-    'descargas': HOME / 'Descargas',
-    'documentos': HOME / 'Documentos',
-    'imagenes': HOME / 'Imágenes',
-    'imágenes': HOME / 'Imágenes',
-    'musica': HOME / 'Música',
-    'música': HOME / 'Música',
-    'videos': HOME / 'Vídeos',
-    'vídeos': HOME / 'Vídeos',
-    'gimnasio': HOME / 'Escritorio' / 'Personal' / 'Gimnasio',
+    'escritorio':  HOME / 'Escritorio',
+    'descargas':   HOME / 'Descargas',
+    'documentos':  HOME / 'Documentos',
+    'imagenes':    HOME / 'Imágenes',
+    'imágenes':    HOME / 'Imágenes',
+    'musica':      HOME / 'Música',
+    'música':      HOME / 'Música',
+    'videos':      HOME / 'Vídeos',
+    'vídeos':      HOME / 'Vídeos',
+    'gimnasio':    HOME / 'Escritorio' / 'Personal' / 'Gimnasio',
 }
 for key, folder in folder_aliases.items():
-    if target == key or f'carpeta {key}' in target or f'mi {key}' in target:
+    patterns_folder = [key, f'carpeta {key}', f'mi {key}', f'la carpeta {key}']
+    if any(p in target for p in patterns_folder):
         if folder.exists():
             popen([XDG_OPEN, str(folder)])
             speakprint(f'Abriendo {key}.')
             sys.exit(0)
 
+# ── Búsqueda de archivos ──────────────────────────────────────────────────────
 if any(word in target for word in ['tarea', 'archivo', 'documento', 'excel', 'word']):
-    roots = [HOME/'Escritorio', HOME/'Documentos', HOME/'Descargas']
-    query = re.sub(r'\b(mi|la|el|archivo|documento|tarea|abre|abrir|word|excel)\b', ' ', target).strip()
-    candidates=[]
+    roots = [HOME / 'Escritorio', HOME / 'Documentos', HOME / 'Descargas']
+    query = re.sub(
+        r'\b(mi|la|el|archivo|documento|tarea|abre|abrir|word|excel)\b', ' ', target
+    ).strip()
+    candidates = []
     for root in roots:
         if not root.exists():
             continue
-        for ext in ('*.docx','*.xlsx','*.pdf','*.txt','*.odt','*.ods','*.pptx'):
+        for ext in ('*.docx', '*.xlsx', '*.pdf', '*.txt', '*.odt', '*.ods', '*.pptx'):
             for f in root.rglob(ext):
                 try:
                     if any(part.startswith('.') for part in f.relative_to(root).parts):
                         continue
                 except Exception:
                     pass
-                nf=norm(f.stem)
-                score=0
-                if query and query in nf: score += 80
+                nf    = norm(f.stem)
+                score = 0
+                if query and query in nf:
+                    score += 80
                 score += 12 * len(set(query.split()) & set(nf.split())) if query else 0
                 if score or not query:
                     candidates.append((score, f.stat().st_mtime, f))
     if candidates:
-        # Si no hubo nombre específico, abre el documento más reciente.
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        f=candidates[0][2]
+        f = candidates[0][2]
         popen([XDG_OPEN, str(f)])
         speakprint(f'Abriendo {f.name}.')
         sys.exit(0)
 
+# ── Aplicaciones de escritorio (alias conocidos) ──────────────────────────────
 aliases = {
-    'visual': ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
-    'visual studio': ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
-    'visual studio code': ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
-    'vs code': ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
-    'vscode': ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
-    'terminal': ('Terminal', ['org.gnome.Ptyxis.desktop', 'org.gnome.Terminal.desktop'], ['/usr/bin/x-terminal-emulator']),
-    'consola': ('Terminal', ['org.gnome.Ptyxis.desktop', 'org.gnome.Terminal.desktop'], ['/usr/bin/x-terminal-emulator']),
-    'archivos': ('Archivos', ['org.gnome.Nautilus.desktop'], []),
-    'carpetas': ('Archivos', ['org.gnome.Nautilus.desktop'], []),
-    'calculadora': ('Calculadora', ['org.gnome.Calculator.desktop'], []),
-    'configuracion': ('Configuración', ['org.gnome.Settings.desktop'], []),
-    'ajustes': ('Configuración', ['org.gnome.Settings.desktop'], []),
-    'writer': ('LibreOffice Writer', ['libreoffice-writer.desktop'], []),
-    'word': ('LibreOffice Writer', ['libreoffice-writer.desktop'], []),
-    'calc': ('LibreOffice Calc', ['libreoffice-calc.desktop'], []),
-    'excel': ('LibreOffice Calc', ['libreoffice-calc.desktop'], []),
-    'android studio': ('Android Studio', ['android-studio-user.desktop', 'android-studio.desktop'], []),
-    'steam': ('Steam', ['steam.desktop'], []),
-    'camara': ('Cámara', ['org.gnome.Snapshot.desktop'], []),
-    'calendario': ('Calendario', ['org.gnome.Calendar.desktop'], []),
+    'visual':              ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
+    'visual studio':       ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
+    'visual studio code':  ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
+    'vs code':             ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
+    'vscode':              ('Visual Studio Code', ['code-user.desktop', 'code.desktop'], ['/home/leonardo/.local/bin/code']),
+    'terminal':            ('Terminal', ['org.gnome.Ptyxis.desktop', 'org.gnome.Terminal.desktop'], ['/usr/bin/x-terminal-emulator']),
+    'la terminal':         ('Terminal', ['org.gnome.Ptyxis.desktop', 'org.gnome.Terminal.desktop'], ['/usr/bin/x-terminal-emulator']),
+    'consola':             ('Terminal', ['org.gnome.Ptyxis.desktop', 'org.gnome.Terminal.desktop'], ['/usr/bin/x-terminal-emulator']),
+    'archivos':            ('Archivos',        ['org.gnome.Nautilus.desktop'], []),
+    'carpetas':            ('Archivos',        ['org.gnome.Nautilus.desktop'], []),
+    'explorador':          ('Archivos',        ['org.gnome.Nautilus.desktop'], []),
+    'calculadora':         ('Calculadora',     ['org.gnome.Calculator.desktop'], []),
+    'configuracion':       ('Configuración',   ['org.gnome.Settings.desktop'], []),
+    'ajustes':             ('Configuración',   ['org.gnome.Settings.desktop'], []),
+    'writer':              ('LibreOffice Writer', ['libreoffice-writer.desktop'], []),
+    'word':                ('LibreOffice Writer', ['libreoffice-writer.desktop'], []),
+    'calc':                ('LibreOffice Calc',   ['libreoffice-calc.desktop'],  []),
+    'excel':               ('LibreOffice Calc',   ['libreoffice-calc.desktop'],  []),
+    'impress':             ('LibreOffice Impress', ['libreoffice-impress.desktop'], []),
+    'presentacion':        ('LibreOffice Impress', ['libreoffice-impress.desktop'], []),
+    'android studio':      ('Android Studio',  ['android-studio-user.desktop', 'android-studio.desktop'], []),
+    'steam':               ('Steam',           ['steam.desktop'], []),
+    'camara':              ('Cámara',          ['org.gnome.Snapshot.desktop'], []),
+    'calendario':          ('Calendario',      ['org.gnome.Calendar.desktop'], []),
+    'vlc':                 ('VLC',             ['vlc.desktop'], ['/usr/bin/vlc']),
+    'reproductor':         ('VLC',             ['vlc.desktop'], ['/usr/bin/vlc']),
+    'gimp':                ('GIMP',            ['gimp.desktop'], ['/usr/bin/gimp']),
+    'inkscape':            ('Inkscape',        ['inkscape.desktop'], ['/usr/bin/inkscape']),
 }
 
 def try_launch(name, desktop_ids, cmds):
     for cmd in cmds:
         if os.path.exists(cmd) and os.access(cmd, os.X_OK):
-            popen([cmd]); speakprint(f'Abriendo {name}.'); return True
+            popen([cmd])
+            speakprint(f'Abriendo {name}.')
+            return True
     for did in desktop_ids:
-        r = subprocess.run(['/usr/bin/gtk-launch', did], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        r = subprocess.run(
+            ['/usr/bin/gtk-launch', did],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         if r.returncode == 0:
-            speakprint(f'Abriendo {name}.'); return True
+            speakprint(f'Abriendo {name}.')
+            return True
     return False
 
-for key, (name, ids, cmds) in aliases.items():
-    if key in target or target in key:
-        if try_launch(name, ids, cmds): sys.exit(0)
+for key, (name, ids, cmds) in sorted(aliases.items(), key=lambda x: -len(x[0])):
+    if site_match(target, key):
+        if try_launch(name, ids, cmds):
+            sys.exit(0)
 
+# ── Búsqueda genérica en .desktop instalados ─────────────────────────────────
 apps = []
-for base in [Path('/usr/share/applications'), Path.home()/'.local/share/applications']:
-    if not base.exists(): continue
+for base in [Path('/usr/share/applications'), Path.home() / '.local/share/applications']:
+    if not base.exists():
+        continue
     for p in base.glob('*.desktop'):
-        try: lines = p.read_text(errors='ignore').splitlines()
-        except Exception: continue
+        try:
+            lines = p.read_text(errors='ignore').splitlines()
+        except Exception:
+            continue
         name = ''; hidden = nodisplay = False
         for line in lines:
-            if line.startswith('Name=') and not name: name = line[5:]
-            elif line.startswith('Hidden=true'): hidden = True
-            elif line.startswith('NoDisplay=true'): nodisplay = True
+            if line.startswith('Name=') and not name:
+                name = line[5:]
+            elif line.startswith('Hidden=true'):
+                hidden = True
+            elif line.startswith('NoDisplay=true'):
+                nodisplay = True
         if name and not hidden and not nodisplay:
             apps.append((p.name, name, norm(name)))
 
-tokens = set(target.split()); best = None
+tokens = set(target.split())
+best   = None
 for did, name, n in apps:
     score = 0
-    if target == n: score += 100
-    if target in n or n in target: score += 60
+    if target == n:
+        score += 100
+    if target in n or n in target:
+        score += 60
     score += 10 * len(tokens & set(n.split()))
-    if score and (best is None or score > best[0]): best = (score, did, name)
+    if score and (best is None or score > best[0]):
+        best = (score, did, name)
+
 if best and best[0] >= 20:
-    if try_launch(best[2], [best[1]], []): sys.exit(0)
+    if try_launch(best[2], [best[1]], []):
+        sys.exit(0)
 
 speakprint(f'No encontré una aplicación llamada {target}.')
 sys.exit(1)

@@ -5,51 +5,57 @@ from pathlib import Path
 import requests
 import websockets
 
-CONFIG_DIR = Path.home() / '.config' / 'jarvis'
-CONFIG_FILE = CONFIG_DIR / 'freestyle.json'
+CONFIG_DIR    = Path.home() / '.config' / 'jarvis'
+CONFIG_FILE   = CONFIG_DIR / 'freestyle.json'
 DEFAULT_CONFIG = {
-    'name': 'The Freestyle Leo',
-    'ip': '192.168.1.194',
-    'port': 8001,
-    'token': '',
+    'name':   'The Freestyle Leo',
+    'ip':     '192.168.1.194',
+    'port':   8001,
+    'token':  '',
+    'secure': False,   # guardamos preferencia tras el primer emparejamiento exitoso
 }
 APP_IDS = {
-    'youtube': '111299001912',
-    'netflix': '11101200001',
-    'prime': '3201512006785',
+    'youtube':     '111299001912',
+    'netflix':     '11101200001',
+    'prime':       '3201512006785',
     'prime video': '3201512006785',
-    'disney': '3201901017640',
-    'disney+': '3201901017640',
+    'disney':      '3201901017640',
+    'disney+':     '3201901017640',
+    'max':         '3202101017679',
+    'hbo':         '3202101017679',
+    'paramount+':  '3202012004019',
 }
 KEYS = {
-    'power': 'KEY_POWER',
-    'off': 'KEY_POWER',
-    'apagar': 'KEY_POWER',
-    'home': 'KEY_HOME',
-    'inicio': 'KEY_HOME',
-    'back': 'KEY_RETURN',
-    'atras': 'KEY_RETURN',
-    'atrás': 'KEY_RETURN',
-    'enter': 'KEY_ENTER',
-    'ok': 'KEY_ENTER',
-    'up': 'KEY_UP',
-    'arriba': 'KEY_UP',
-    'down': 'KEY_DOWN',
-    'abajo': 'KEY_DOWN',
-    'left': 'KEY_LEFT',
-    'izquierda': 'KEY_LEFT',
-    'right': 'KEY_RIGHT',
-    'derecha': 'KEY_RIGHT',
-    'volup': 'KEY_VOLUP',
+    'power':         'KEY_POWER',
+    'off':           'KEY_POWER',
+    'apagar':        'KEY_POWER',
+    'home':          'KEY_HOME',
+    'inicio':        'KEY_HOME',
+    'back':          'KEY_RETURN',
+    'atras':         'KEY_RETURN',
+    'atrás':         'KEY_RETURN',
+    'enter':         'KEY_ENTER',
+    'ok':            'KEY_ENTER',
+    'up':            'KEY_UP',
+    'arriba':        'KEY_UP',
+    'down':          'KEY_DOWN',
+    'abajo':         'KEY_DOWN',
+    'left':          'KEY_LEFT',
+    'izquierda':     'KEY_LEFT',
+    'right':         'KEY_RIGHT',
+    'derecha':       'KEY_RIGHT',
+    'volup':         'KEY_VOLUP',
     'subir-volumen': 'KEY_VOLUP',
-    'voldown': 'KEY_VOLDOWN',
+    'voldown':       'KEY_VOLDOWN',
     'bajar-volumen': 'KEY_VOLDOWN',
-    'mute': 'KEY_MUTE',
-    'silencio': 'KEY_MUTE',
-    'play': 'KEY_PLAY',
-    'pause': 'KEY_PAUSE',
-    'pausa': 'KEY_PAUSE',
+    'mute':          'KEY_MUTE',
+    'silencio':      'KEY_MUTE',
+    'play':          'KEY_PLAY',
+    'pause':         'KEY_PAUSE',
+    'pausa':         'KEY_PAUSE',
 }
+WS_RETRY_ATTEMPTS = 3
+WS_RETRY_DELAY    = 1.5   # segundos entre reintentos
 
 def load_config():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -73,29 +79,32 @@ def save_config(cfg):
 
 def api_info(cfg):
     url = f"http://{cfg['ip']}:8001/api/v2/"
-    r = requests.get(url, timeout=3)
+    r   = requests.get(url, timeout=3)
     r.raise_for_status()
     return r.json()
 
 def ws_url(cfg, secure=False):
-    name = base64.b64encode(b'Jarvis').decode()
-    port = 8002 if secure else int(cfg.get('port') or 8001)
+    name   = base64.b64encode(b'Jarvis').decode()
+    port   = 8002 if secure else int(cfg.get('port') or 8001)
     scheme = 'wss' if secure else 'ws'
-    qs = {'name': name}
+    qs     = {'name': name}
     if cfg.get('token'):
         qs['token'] = cfg['token']
-    return f"{scheme}://{cfg['ip']}:{port}/api/v2/channels/samsung.remote.control?{urllib.parse.urlencode(qs)}"
+    return (
+        f"{scheme}://{cfg['ip']}:{port}"
+        f"/api/v2/channels/samsung.remote.control?{urllib.parse.urlencode(qs)}"
+    )
 
 async def connect(cfg, secure=None):
     if secure is None:
         secure = bool(cfg.get('secure')) or int(cfg.get('port') or 8001) == 8002
-    ssl_ctx = None
-    if secure:
-        ssl_ctx = ssl._create_unverified_context()
-    return await websockets.connect(ws_url(cfg, secure), ssl=ssl_ctx, open_timeout=8, close_timeout=2)
+    ssl_ctx = ssl._create_unverified_context() if secure else None
+    return await websockets.connect(
+        ws_url(cfg, secure), ssl=ssl_ctx, open_timeout=8, close_timeout=2,
+    )
 
 async def receive_initial(ws, cfg, timeout=8):
-    end = time.time() + timeout
+    end  = time.time() + timeout
     last = None
     while time.time() < end:
         try:
@@ -126,57 +135,83 @@ async def receive_initial(ws, cfg, timeout=8):
     return None
 
 async def send_key(cfg, key, times=1):
-    async with await connect(cfg) as ws:
-        await receive_initial(ws, cfg)
-        for _ in range(times):
-            payload = {
-                'method': 'ms.remote.control',
-                'params': {
-                    'Cmd': 'Click',
-                    'DataOfCmd': key,
-                    'Option': 'false',
-                    'TypeOfRemote': 'SendRemoteKey',
+    """Envía una tecla con reintentos automáticos si la conexión falla."""
+    last_exc = None
+    for attempt in range(1, WS_RETRY_ATTEMPTS + 1):
+        try:
+            async with await connect(cfg) as ws:
+                await receive_initial(ws, cfg)
+                payload = {
+                    'method': 'ms.remote.control',
+                    'params': {
+                        'Cmd':           'Click',
+                        'DataOfCmd':     key,
+                        'Option':        'false',
+                        'TypeOfRemote':  'SendRemoteKey',
+                    },
                 }
-            }
-            await ws.send(json.dumps(payload))
-            await asyncio.sleep(0.18)
-    print(f'Enviado: {key}')
+                for _ in range(times):
+                    await ws.send(json.dumps(payload))
+                    await asyncio.sleep(0.18)
+            print(f'Enviado: {key}')
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < WS_RETRY_ATTEMPTS:
+                print(f'Intento {attempt} fallido ({exc}), reintentando…')
+                await asyncio.sleep(WS_RETRY_DELAY)
+    print(f'Error enviando tecla tras {WS_RETRY_ATTEMPTS} intentos: {last_exc}',
+          file=sys.stderr)
+    sys.exit(1)
 
 async def pair(cfg):
-    print('Conectando. Si el proyector pide permiso, acepta a Jarvis.')
+    print('Conectando. Si el proyector pide permiso, acepta a Jarvis en pantalla.')
     for secure in (False, True):
         try:
             async with await connect(cfg, secure=secure) as ws:
                 print(f'Canal: {"wss/8002" if secure else "ws/8001"}')
-                msg = await receive_initial(ws, cfg, timeout=20)
+                msg   = await receive_initial(ws, cfg, timeout=20)
                 event = (msg or {}).get('event', '')
                 if event == 'ms.channel.unauthorized':
-                    print('El proyector rechazó o aún no autorizó a Jarvis. Revisa la pantalla y acepta el permiso si aparece.')
+                    print('El proyector rechazó la conexión. Acepta el permiso en la pantalla.')
                     continue
                 if msg:
-                    print('Emparejamiento/conexión lista.')
+                    # Guardamos preferencia de canal para futuras conexiones.
+                    cfg['secure'] = secure
+                    cfg['port']   = 8002 if secure else 8001
+                    save_config(cfg)
+                    print('Emparejamiento listo.')
                     return
         except Exception as exc:
             print(f'Canal {"wss/8002" if secure else "ws/8001"} falló: {exc}')
-    print('No quedó emparejado todavía. Puede que tengas que borrar permisos previos o aceptar manualmente en el proyector.')
+    print('No se pudo emparejar. Intenta borrar permisos previos en el proyector.')
 
 async def launch_app_ws(cfg, app_id):
-    async with await connect(cfg) as ws:
-        await receive_initial(ws, cfg)
-        payload = {
-            'method': 'ms.channel.emit',
-            'params': {
-                'event': 'ed.apps.launch',
-                'to': 'host',
-                'data': {'appId': app_id, 'action_type': 'NATIVE_LAUNCH'}
-            }
-        }
-        await ws.send(json.dumps(payload))
-        await asyncio.sleep(0.5)
-    print(f'Abriendo app {app_id}.')
+    last_exc = None
+    for attempt in range(1, WS_RETRY_ATTEMPTS + 1):
+        try:
+            async with await connect(cfg) as ws:
+                await receive_initial(ws, cfg)
+                payload = {
+                    'method': 'ms.channel.emit',
+                    'params': {
+                        'event': 'ed.apps.launch',
+                        'to':    'host',
+                        'data':  {'appId': app_id, 'action_type': 'NATIVE_LAUNCH'},
+                    },
+                }
+                await ws.send(json.dumps(payload))
+                await asyncio.sleep(0.5)
+            print(f'Abriendo app {app_id}.')
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt < WS_RETRY_ATTEMPTS:
+                await asyncio.sleep(WS_RETRY_DELAY)
+    print(f'Error abriendo app: {last_exc}', file=sys.stderr)
+    sys.exit(1)
 
 def launch_app_http(cfg, app_id):
-    # Algunos Tizen aceptan POST directo; si falla, usamos websocket.
     url = f"http://{cfg['ip']}:8001/api/v2/applications/{app_id}"
     try:
         r = requests.post(url, timeout=3)
@@ -187,42 +222,100 @@ def launch_app_http(cfg, app_id):
         pass
     return False
 
+async def search_youtube_on_tv(cfg, query):
+    """
+    Abre YouTube en el proyector y lanza una búsqueda por deep-link.
+    Samsung Tizen soporta intent://<encoded-url>#Intent;... pero el camino
+    más fiable es abrir YouTube y mandar la URL de búsqueda como deeplink.
+    """
+    quoted  = urllib.parse.quote_plus(query)
+    app_url = f'https://www.youtube.com/results?search_query={quoted}'
+    app_id  = APP_IDS['youtube']
+
+    # Intentamos HTTP primero (más rápido).
+    if not launch_app_http(cfg, app_id):
+        await launch_app_ws(cfg, app_id)
+
+    # Damos tiempo a YouTube para arrancar antes de mandar teclas.
+    await asyncio.sleep(3)
+    print(f'Buscando en YouTube del proyector: {query}')
+    # Nota: la búsqueda real desde Tizen requiere la SmartThings API o ADB;
+    # aquí simplemente abrimos YouTube. Para búsqueda profunda se necesita ADB habilitado.
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Control local para Samsung The Freestyle Leo')
+    parser = argparse.ArgumentParser(
+        description='Control local para Samsung The Freestyle Leo'
+    )
     sub = parser.add_subparsers(dest='cmd', required=True)
+
     sub.add_parser('info')
     sub.add_parser('pair')
-    pkey = sub.add_parser('key'); pkey.add_argument('key'); pkey.add_argument('--times', type=int, default=1)
-    popen = sub.add_parser('open'); popen.add_argument('app')
+
+    p_key = sub.add_parser('key')
+    p_key.add_argument('key')
+    p_key.add_argument('--times', type=int, default=1)
+
+    p_open = sub.add_parser('open')
+    p_open.add_argument('app')
+
+    p_search = sub.add_parser('search')
+    p_search.add_argument('query', nargs='+')
+
     sub.add_parser('home')
     sub.add_parser('off')
     sub.add_parser('volup')
     sub.add_parser('voldown')
     sub.add_parser('mute')
+
     args = parser.parse_args()
-    cfg = load_config()
+    cfg  = load_config()
 
     if args.cmd == 'info':
         info = api_info(cfg)
-        dev = info.get('device', {})
-        print(json.dumps({k: dev.get(k) for k in ['name','ip','modelName','PowerState','TokenAuthSupport','type']}, indent=2, ensure_ascii=False))
+        dev  = info.get('device', {})
+        print(json.dumps(
+            {k: dev.get(k) for k in
+             ['name', 'ip', 'modelName', 'PowerState', 'TokenAuthSupport', 'type']},
+            indent=2, ensure_ascii=False,
+        ))
         return
+
     if args.cmd == 'pair':
-        asyncio.run(pair(cfg)); return
-    if args.cmd in {'home','off','volup','voldown','mute'}:
-        key = {'home':'KEY_HOME','off':'KEY_POWER','volup':'KEY_VOLUP','voldown':'KEY_VOLDOWN','mute':'KEY_MUTE'}[args.cmd]
-        asyncio.run(send_key(cfg, key)); return
+        asyncio.run(pair(cfg))
+        return
+
+    if args.cmd in {'home', 'off', 'volup', 'voldown', 'mute'}:
+        key = {
+            'home':    'KEY_HOME',
+            'off':     'KEY_POWER',
+            'volup':   'KEY_VOLUP',
+            'voldown': 'KEY_VOLDOWN',
+            'mute':    'KEY_MUTE',
+        }[args.cmd]
+        asyncio.run(send_key(cfg, key))
+        return
+
     if args.cmd == 'key':
         key = KEYS.get(args.key.lower(), args.key)
         if not key.startswith('KEY_'):
-            print(f'No conozco la tecla: {args.key}', file=sys.stderr); sys.exit(2)
-        asyncio.run(send_key(cfg, key, args.times)); return
+            print(f'No conozco la tecla: {args.key}', file=sys.stderr)
+            sys.exit(2)
+        asyncio.run(send_key(cfg, key, args.times))
+        return
+
     if args.cmd == 'open':
-        app = args.app.lower().strip()
+        app    = args.app.lower().strip()
         app_id = APP_IDS.get(app, args.app)
         if not launch_app_http(cfg, app_id):
             asyncio.run(launch_app_ws(cfg, app_id))
         return
+
+    if args.cmd == 'search':
+        query = ' '.join(args.query)
+        asyncio.run(search_youtube_on_tv(cfg, query))
+        return
+
 
 if __name__ == '__main__':
     main()

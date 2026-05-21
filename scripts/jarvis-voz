@@ -27,7 +27,9 @@ MIN_LISTEN_SECONDS="0.45"
 SILENCE_SECONDS="0.65"
 MAX_FOLLOWUPS="3"
 PRECISE_TRANSCRIBE="${JARVIS_PRECISE_TRANSCRIBE:-0}"
-CAPTURE_VOLUME="30%"
+# Volumen de captura; se puede sobreescribir con JARVIS_CAPTURE_VOLUME=40%
+CAPTURE_VOLUME="${JARVIS_CAPTURE_VOLUME:-30%}"
+
 WORKDIR="${XDG_RUNTIME_DIR:-/tmp}/jarvis-voz"
 mkdir -p "$WORKDIR"
 LOCKFILE="$WORKDIR/jarvis-voz.lock"
@@ -35,14 +37,19 @@ CANCEL_FLAG="$WORKDIR/cancel.flag"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 ERR="$WORKDIR/error.log"
 rm -f "$CANCEL_FLAG" 2>/dev/null || true
+
 PROMPT="Transcribe únicamente en español de México. Si al inicio escucha algo parecido a 'oye Jarvis', 'Jarvis', 'para la llave' u otra frase rara de activación, ignórala. Devuelve solo la instrucción real. Vocabulario probable: Freestyle, cine, proyector, The Freestyle Leo, apaga el Freestyle, enciende el Freestyle, prende el cine, apaga el cine, abre YouTube en el cine, abre Netflix en el Freestyle, sube volumen del cine, baja volumen del Freestyle. Si suena como 'proyecto' o 'director' cerca de acciones como apagar, YouTube, Netflix o volumen, probablemente quiso decir 'proyector'."
 
 notify() {
   local msg="$1"
   local state="${2:-reply}"
-  if [[ -x "$OVERLAY" ]]; then "$OVERLAY" --state "$state" "$msg" 9>&- >/dev/null 2>&1 || true;
-  elif command -v notify-send >/dev/null 2>&1; then notify-send "Jarvis" "$msg" || true; fi
+  if [[ -x "$OVERLAY" ]]; then
+    "$OVERLAY" --state "$state" "$msg" 9>&- >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send "Jarvis" "$msg" || true
+  fi
 }
+
 quick_say() {
   local text="$1"
   if [[ -x "$JARVIS_SAY" ]]; then
@@ -51,24 +58,31 @@ quick_say() {
     "$SPD_SAY" -l es -r 5 -p -25 "$text" >/dev/null 2>&1 || true
   fi
 }
+
 beep_ready() {
+  # Intentamos varios identificadores de sonido hasta encontrar uno que exista.
   if [[ -x "$CANBERRA" ]]; then
-    "$CANBERRA" -i bell >/dev/null 2>&1 || true
-  else
-    printf '\a' || true
+    for snd in message-new-instant bell audio-bell; do
+      "$CANBERRA" -i "$snd" >/dev/null 2>&1 && return 0
+    done
   fi
+  printf '\a' || true
 }
+
 clean_command() {
   local text="$1"
-  text="$(printf '%s' "$text" | sed -E 's/^[Pp]ara la llave,?[[:space:]]*//; s/^[Oo]ye[[:space:]]+[Jj]arvis,?[[:space:]]*//; s/^[Jj]arvis,?[[:space:]]*//')"
+  text="$(printf '%s' "$text" | sed -E \
+    's/^[Pp]ara la llave,?[[:space:]]*//;
+     s/^[Oo]ye[[:space:]]+[Jj]arvis,?[[:space:]]*//;
+     s/^[Jj]arvis,?[[:space:]]*//')"
   local lower
   lower="$(printf '%s' "$text" | tr '[:upper:]ÁÉÍÓÚÜÑ¿?' '[:lower:]áéíóúüñ  ')"
-
   if [[ "$lower" == *"hora es"* || "$lower" == *"qué hora"* || "$lower" == *"que hora"* ]]; then
     text="¿Qué hora es?"
   fi
   printf '%s' "$text"
 }
+
 speak_reply() {
   local text="$1"
   [[ -z "${text// }" ]] && return 0
@@ -76,10 +90,12 @@ speak_reply() {
   quick_say "$text"
   [[ -f "$CANCEL_FLAG" ]] && return 130
 }
+
 say_async() {
   local text="$1"
   ( quick_say "$text" ) 9>&- >/dev/null 2>&1 &
 }
+
 listen_once() {
   local label="$1"
   local duration="$2"
@@ -92,45 +108,67 @@ listen_once() {
   notify "Escuchando…" "listening"
 
   [[ -x "$AMIXER" ]] && "$AMIXER" -q set Capture "$CAPTURE_VOLUME" cap 2>/dev/null || true
+
+  # El script Python usa select() para lecturas no bloqueantes, evitando que
+  # un cuelgue de arecord congele todo el proceso.
   if ! "$PYTHON3" - "$audio" "$duration" "$MIN_LISTEN_SECONDS" "$SILENCE_SECONDS" "$ARECORD" 2>"$ERR" <<'PYREC'
-import array, collections, math, os, signal, subprocess, sys, time, wave
+import array, collections, math, os, select, signal, subprocess, sys, time, wave
 out, max_s, min_s, silence_s, arecord = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
 rate, width, channels = 16000, 2, 1
 chunk_bytes = 1600  # 50 ms
-proc = subprocess.Popen([arecord, '-q', '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-t', 'raw'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-frames=[]; rms_hist=collections.deque(maxlen=12)
-start=time.time(); speech_seen=False; last_voice=start; noise_floor=220
+
+proc = subprocess.Popen(
+    [arecord, '-q', '-f', 'S16_LE', '-r', str(rate), '-c', str(channels), '-t', 'raw'],
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+)
+frames = []; rms_hist = collections.deque(maxlen=12)
+start = time.time(); speech_seen = False; last_voice = start; noise_floor = 220
+
 try:
     while True:
-        data = proc.stdout.read(chunk_bytes) if proc.stdout else b''
+        now = time.time(); elapsed = now - start
+        if elapsed >= max_s:
+            break
+        # Lectura con timeout de 0.2 s para que el bucle no se bloquee.
+        ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+        if not ready:
+            # Sin datos: si el proceso murió, salimos.
+            if proc.poll() is not None:
+                break
+            continue
+        data = proc.stdout.read(chunk_bytes)
         if not data:
             break
-        now=time.time(); elapsed=now-start
+
         frames.append(data)
         samples = array.array('h')
         samples.frombytes(data)
         if sys.byteorder != 'little':
             samples.byteswap()
-        rms = math.sqrt(sum(x*x for x in samples) / max(len(samples), 1))
+        rms = math.sqrt(sum(x * x for x in samples) / max(len(samples), 1))
         if not speech_seen and elapsed < 0.7:
             rms_hist.append(rms)
             if rms_hist:
-                noise_floor=max(180, sum(rms_hist)/len(rms_hist)*1.8)
-        threshold=max(420, noise_floor)
+                noise_floor = max(180, sum(rms_hist) / len(rms_hist) * 1.8)
+        threshold = max(420, noise_floor)
         if rms > threshold:
-            speech_seen=True; last_voice=now
-        if elapsed >= min_s and speech_seen and (now-last_voice) >= silence_s:
-            break
-        if elapsed >= max_s:
+            speech_seen = True; last_voice = now
+        if elapsed >= min_s and speech_seen and (now - last_voice) >= silence_s:
             break
 finally:
     try:
         proc.terminate(); proc.wait(timeout=0.7)
     except Exception:
-        try: proc.kill()
-        except Exception: pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
 with wave.open(out, 'wb') as wf:
-    wf.setnchannels(channels); wf.setsampwidth(width); wf.setframerate(rate); wf.writeframes(b''.join(frames))
+    wf.setnchannels(channels)
+    wf.setsampwidth(width)
+    wf.setframerate(rate)
+    wf.writeframes(b''.join(frames))
 PYREC
   then
     echo ""
@@ -138,47 +176,60 @@ PYREC
   fi
 
   if [[ -x "$FFMPEG" ]]; then
-    "$FFMPEG" -y -hide_banner -loglevel error -i "$audio" -af "highpass=f=80,lowpass=f=7600,afftdn=nf=-25,dynaudnorm=f=150:g=8" -ar 16000 -ac 1 "$clean_audio" 2>"$ERR" || cp "$audio" "$clean_audio"
+    "$FFMPEG" -y -hide_banner -loglevel error \
+      -i "$audio" \
+      -af "highpass=f=80,lowpass=f=7600,afftdn=nf=-25,dynaudnorm=f=150:g=8" \
+      -ar 16000 -ac 1 "$clean_audio" 2>"$ERR" || cp "$audio" "$clean_audio"
   else
     cp "$audio" "$clean_audio"
   fi
 
   if [[ -x "$VOSK_TRANSCRIBE" ]]; then
-    text="$($VOSK_TRANSCRIBE "$clean_audio" 2>"$ERR" | sed '/^[[:space:]]*$/d' | head -n 1 || true)"
+    text="$("$VOSK_TRANSCRIBE" "$clean_audio" 2>"$ERR" \
+      | sed '/^[[:space:]]*$/d' | head -n 1 || true)"
   fi
 
-  local lower_text
-  lower_text="$(printf '%s' "$text" | tr '[:upper:]ÁÉÍÓÚÜÑ¿?' '[:lower:]áéíóúüñ  ')"
-  # Ruta rápida: Vosk primero. La transcripción de OpenAI se deja opcional porque añade varios segundos.
-  # Actívala temporalmente con JARVIS_PRECISE_TRANSCRIBE=1 si quieres diagnosticar una frase difícil.
+  # Transcripción de nube: solo si PRECISE_TRANSCRIBE=1 y Vosk no entendió nada.
   if [[ "$PRECISE_TRANSCRIBE" == "1" && -z "${text// }" ]]; then
-    if "$OPENCLAW" capability audio transcribe --file "$clean_audio" --language es --model openai/gpt-4o-transcribe --prompt "$PROMPT" --json >"$trans_json" 2>"$ERR"; then
+    if "$OPENCLAW" capability audio transcribe \
+        --file "$clean_audio" --language es \
+        --model openai/gpt-4o-transcribe \
+        --prompt "$PROMPT" --json >"$trans_json" 2>"$ERR"; then
       local precise
-      precise="$($JQ -r '.. | objects | (.text? // .transcript? // .content? // empty)' "$trans_json" | sed '/^[[:space:]]*$/d' | head -n 1)"
+      precise="$($JQ -r '.. | objects | (.text? // .transcript? // .content? // empty)' \
+        "$trans_json" | sed '/^[[:space:]]*$/d' | head -n 1)"
       if [[ -n "${precise// }" ]]; then
         text="$precise"
       fi
     fi
   fi
+
   clean_command "$text"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Comandos locales: ejecutados sin consultar al agente → latencia mínima
+# ─────────────────────────────────────────────────────────────────────────────
 handle_local_command() {
   local text="$1"
   local lower
   lower="$(printf '%s' "$text" | tr '[:upper:]ÁÉÍÓÚÜÑ¿?' '[:lower:]áéíóúüñ  ')"
 
-  # Comandos ultrarrápidos: se resuelven aquí para no consultar al agente.
-  if [[ "$lower" =~ (^|[[:space:]])(para|detente|cállate|callate|cancela|cancelar|silencio jarvis|ya no)([[:space:]]|$) ]]; then
+  # ── Stop ─────────────────────────────────────────────────────────────────
+  if [[ "$lower" =~ (^|[[:space:]])(para|detente|callate|cancela|cancelar|silencio\ jarvis|ya\ no|basta|olvida|olvidalo)([[:space:]]|$) ]]; then
     [[ -x "$JARVIS_STOP" ]] && "$JARVIS_STOP" >/dev/null 2>&1 || true
     return 0
   fi
 
-  if [[ "$lower" =~ ^(hola|hey|buenas|ola)( jarvis)?$ || "$lower" == *"estas ahi"* || "$lower" == *"estás ahí"* ]]; then
+  # ── Saludos ──────────────────────────────────────────────────────────────
+  if [[ "$lower" =~ ^(hola|hey|buenas|ola)( jarvis)?$ \
+     || "$lower" == *"estas ahi"* || "$lower" == *"estás ahí"* ]]; then
     say_async "Aquí estoy."
     notify "Jarvis: Aquí estoy." "reply"
     return 0
   fi
-  if [[ "$lower" == *"como estas"* || "$lower" == *"cómo estás"* || "$lower" == *"que tal"* || "$lower" == *"qué tal"* ]]; then
+  if [[ "$lower" == *"como estas"* || "$lower" == *"cómo estás"* \
+     || "$lower" == *"que tal"* || "$lower" == *"qué tal"* ]]; then
     say_async "Listo y atento."
     notify "Jarvis: Listo y atento." "reply"
     return 0
@@ -189,47 +240,57 @@ handle_local_command() {
     return 0
   fi
 
-  if [[ "$lower" =~ (volumen|audio|sonido|ponlo|pon|poner|déjalo|dejalo|al|a)[[:space:]]+([0-9]{1,3}) || "$lower" =~ ([0-9]{1,3})[[:space:]]*(por ciento|%) || ( "$lower" == *"volumen"* && ( "$lower" == *"cero"* || "$lower" == *"diez"* || "$lower" == *"veinte"* || "$lower" == *"treinta"* || "$lower" == *"cuarenta"* || "$lower" == *"cincuenta"* || "$lower" == *"sesenta"* || "$lower" == *"setenta"* || "$lower" == *"ochenta"* || "$lower" == *"noventa"* || "$lower" == *"cien"* ) ) ]]; then
+  # ── Volumen exacto ───────────────────────────────────────────────────────
+  if [[ "$lower" =~ (volumen|audio|sonido|ponlo|pon|poner|déjalo|dejalo|al|a)[[:space:]]+([0-9]{1,3}) \
+     || "$lower" =~ ([0-9]{1,3})[[:space:]]*(por ciento|%) \
+     || ( "$lower" == *"volumen"* && ( "$lower" == *"cero"* || "$lower" == *"diez"* \
+       || "$lower" == *"veinte"* || "$lower" == *"treinta"* || "$lower" == *"cuarenta"* \
+       || "$lower" == *"cincuenta"* || "$lower" == *"sesenta"* || "$lower" == *"setenta"* \
+       || "$lower" == *"ochenta"* || "$lower" == *"noventa"* || "$lower" == *"cien"* ) ) ]]; then
     local level
     level="$(grep -Eo '[0-9]{1,3}' <<<"$lower" | head -n 1 || true)"
     if [[ -z "${level:-}" ]]; then
       case "$lower" in
-        *cero*) level=0 ;;
-        *diez*) level=10 ;;
-        *veinte*) level=20 ;;
-        *treinta*) level=30 ;;
-        *cuarenta*) level=40 ;;
-        *cincuenta*) level=50 ;;
-        *sesenta*) level=60 ;;
-        *setenta*) level=70 ;;
-        *ochenta*) level=80 ;;
-        *noventa*) level=90 ;;
-        *cien*) level=100 ;;
+        *cero*)    level=0   ;;
+        *diez*)    level=10  ;;
+        *veinte*)  level=20  ;;
+        *treinta*) level=30  ;;
+        *cuarenta*)level=40  ;;
+        *cincuenta*)level=50 ;;
+        *sesenta*) level=60  ;;
+        *setenta*) level=70  ;;
+        *ochenta*) level=80  ;;
+        *noventa*) level=90  ;;
+        *cien*)    level=100 ;;
       esac
     fi
     if [[ -n "${level:-}" ]]; then
-      if (( level < 0 )); then level=0; fi
-      if (( level > 100 )); then level=100; fi
+      (( level < 0   )) && level=0
+      (( level > 100 )) && level=100
       [[ -x "$WPCTL" ]] && "$WPCTL" set-volume @DEFAULT_AUDIO_SINK@ "${level}%" 2>/dev/null || true
       say_async "Volumen al ${level} por ciento."
       return 0
     fi
   fi
 
-  if [[ "$lower" == *"sube tantito"* || "$lower" == *"subele tantito"* || "$lower" == *"súbele tantito"* || "$lower" == *"sube un poco"* ]]; then
+  # ── Ajuste de volumen relativo ────────────────────────────────────────────
+  if [[ "$lower" == *"sube tantito"* || "$lower" == *"subele tantito"* \
+     || "$lower" == *"súbele tantito"* || "$lower" == *"sube un poco"* ]]; then
     [[ -x "$WPCTL" ]] && "$WPCTL" set-volume @DEFAULT_AUDIO_SINK@ 3%+ 2>/dev/null || true
     say_async "Listo."
     return 0
   fi
-  if [[ "$lower" == *"baja tantito"* || "$lower" == *"bajale tantito"* || "$lower" == *"bájale tantito"* || "$lower" == *"baja un poco"* ]]; then
+  if [[ "$lower" == *"baja tantito"* || "$lower" == *"bajale tantito"* \
+     || "$lower" == *"bájale tantito"* || "$lower" == *"baja un poco"* ]]; then
     [[ -x "$WPCTL" ]] && "$WPCTL" set-volume @DEFAULT_AUDIO_SINK@ 3%- 2>/dev/null || true
     say_async "Listo."
     return 0
   fi
 
+  # ── Intent parser (Freestyle) ─────────────────────────────────────────────
   if [[ -x "$JARVIS_INTENT" ]]; then
     local intent handled domain action app
-    intent="$($JARVIS_INTENT "$text" 2>/dev/null || printf '{"handled":false}')"
+    intent="$("$JARVIS_INTENT" "$text" 2>/dev/null || printf '{"handled":false}')"
     handled="$($JQ -r '.handled // false' <<<"$intent" 2>/dev/null || printf 'false')"
     if [[ "$handled" == "true" ]]; then
       domain="$($JQ -r '.domain // ""' <<<"$intent")"
@@ -245,67 +306,73 @@ handle_local_command() {
             [[ -n "${app// }" ]] && "$JARVIS_FREESTYLE" open "$app" >/dev/null 2>&1 || true
             notify "Abriendo ${app:-la app} en el proyector." "reply"
             say_async "Abriendo ${app:-la app} en el proyector."
-            return 0
-            ;;
+            return 0 ;;
+          search_youtube)
+            local yt_query
+            yt_query="$($JQ -r '.args.query // ""' <<<"$intent")"
+            if [[ -n "${yt_query// }" ]]; then
+              "$JARVIS_FREESTYLE" search "$yt_query" >/dev/null 2>&1 || true
+              notify "Buscando '${yt_query}' en el proyector." "reply"
+              say_async "Buscando ${yt_query} en el proyector."
+              return 0
+            fi ;;
           power_off)
             "$JARVIS_FREESTYLE" off >/dev/null 2>&1 || true
-            notify "Apagando el proyector." "reply"
-            say_async "Apagando el proyector."
-            return 0
-            ;;
+            notify "Apagando el proyector." "reply"; say_async "Apagando el proyector."
+            return 0 ;;
           power_on)
             "$JARVIS_FREESTYLE" key power >/dev/null 2>&1 || true
-            notify "Encendiendo el proyector." "reply"
-            say_async "Encendiendo el proyector."
-            return 0
-            ;;
+            notify "Encendiendo el proyector." "reply"; say_async "Encendiendo el proyector."
+            return 0 ;;
           home)
             "$JARVIS_FREESTYLE" home >/dev/null 2>&1 || true
-            notify "Inicio del proyector." "reply"
-            say_async "Listo."
-            return 0
-            ;;
+            notify "Inicio del proyector." "reply"; say_async "Listo."
+            return 0 ;;
           back)
             "$JARVIS_FREESTYLE" key atras >/dev/null 2>&1 || true
-            notify "Atrás en el proyector." "reply"
-            say_async "Listo."
-            return 0
-            ;;
+            notify "Atrás en el proyector." "reply"; say_async "Listo."
+            return 0 ;;
           enter|up|down|left|right|pause|play)
             "$JARVIS_FREESTYLE" key "$action" >/dev/null 2>&1 || true
-            notify "Listo." "reply"
-            say_async "Listo."
-            return 0
-            ;;
+            notify "Listo." "reply"; say_async "Listo."
+            return 0 ;;
           volume_up)
             "$JARVIS_FREESTYLE" volup >/dev/null 2>&1 || true
-            notify "Subí el volumen del proyector." "reply"
-            say_async "Subí el volumen del proyector."
-            return 0
-            ;;
+            notify "Subí el volumen del proyector." "reply"; say_async "Subí el volumen del proyector."
+            return 0 ;;
           volume_down)
             "$JARVIS_FREESTYLE" voldown >/dev/null 2>&1 || true
-            notify "Bajé el volumen del proyector." "reply"
-            say_async "Bajé el volumen del proyector."
-            return 0
-            ;;
+            notify "Bajé el volumen del proyector." "reply"; say_async "Bajé el volumen del proyector."
+            return 0 ;;
           mute)
             "$JARVIS_FREESTYLE" mute >/dev/null 2>&1 || true
-            notify "Alterné el silencio del proyector." "reply"
-            say_async "Alterné el silencio del proyector."
-            return 0
-            ;;
+            notify "Alterné el silencio del proyector." "reply"; say_async "Alterné el silencio del proyector."
+            return 0 ;;
         esac
       fi
     fi
   fi
 
+  # ── Detección de comandos del proyector por palabras clave ───────────────
   local is_freestyle_cmd=1
   if [[ -x "$JARVIS_FREESTYLE" ]]; then
-    if [[ "$lower" == *"cine"* || "$lower" == *"freestyle"* || "$lower" == *"free style"* || "$lower" == *"fris"* || "$lower" == *"proyector"* ]]; then
+    if [[ "$lower" == *"cine"* || "$lower" == *"freestyle"* \
+       || "$lower" == *"free style"* || "$lower" == *"fris"* \
+       || "$lower" == *"proyector"* ]]; then
       is_freestyle_cmd=0
-    elif [[ ( "$lower" == *"proyecto"* || "$lower" == *"director"* || "$lower" == *"productor"* || "$lower" == *"cristo"* || "$lower" == *"cristal"* || "$lower" == *"rupturista"* ) && ( "$lower" == *"apaga"* || "$lower" == *"apagar"* || "$lower" == *"enciende"* || "$lower" == *"encender"* || "$lower" == *"prende"* || "$lower" == *"prender"* || "$lower" == *"youtube"* || "$lower" == *"netflix"* || "$lower" == *"volumen"* || "$lower" == *"silencio"* || "$lower" == *"mute"* || "$lower" == *"pausa"* || "$lower" == *"inicio"* || "$lower" == *"home"* || "$lower" == *"atrás"* || "$lower" == *"atras"* || "$lower" == *"regresa"* ) ]]; then
-      # Vosk suele entender "proyector" como "proyecto" o "director".
+    elif [[ ( "$lower" == *"proyecto"* || "$lower" == *"director"* \
+           || "$lower" == *"productor"* || "$lower" == *"cristo"* \
+           || "$lower" == *"cristal"* || "$lower" == *"rupturista"* \
+           || "$lower" == *"proyectar"* || "$lower" == *"proyección"* ) \
+        && ( "$lower" == *"apaga"* || "$lower" == *"apagar"* \
+           || "$lower" == *"enciende"* || "$lower" == *"encender"* \
+           || "$lower" == *"prende"* || "$lower" == *"prender"* \
+           || "$lower" == *"youtube"* || "$lower" == *"netflix"* \
+           || "$lower" == *"volumen"* || "$lower" == *"silencio"* \
+           || "$lower" == *"mute"* || "$lower" == *"pausa"* \
+           || "$lower" == *"inicio"* || "$lower" == *"home"* \
+           || "$lower" == *"atrás"* || "$lower" == *"atras"* \
+           || "$lower" == *"regresa"* ) ]]; then
       is_freestyle_cmd=0
     fi
   fi
@@ -313,84 +380,78 @@ handle_local_command() {
   if [[ "$is_freestyle_cmd" -eq 0 ]]; then
     if [[ "$lower" == *"youtube"* ]]; then
       "$JARVIS_FREESTYLE" open youtube >/dev/null 2>&1 || true
-      notify "Abriendo YouTube en el proyector." "reply"
-      say_async "Abriendo YouTube en el proyector."
+      notify "Abriendo YouTube en el proyector." "reply"; say_async "Abriendo YouTube en el proyector."
       return 0
     fi
     if [[ "$lower" == *"netflix"* ]]; then
       "$JARVIS_FREESTYLE" open netflix >/dev/null 2>&1 || true
-      notify "Abriendo Netflix en el proyector." "reply"
-      say_async "Abriendo Netflix en el proyector."
+      notify "Abriendo Netflix en el proyector." "reply"; say_async "Abriendo Netflix en el proyector."
       return 0
     fi
     if [[ "$lower" == *"inicio"* || "$lower" == *"home"* || "$lower" == *"principal"* ]]; then
       "$JARVIS_FREESTYLE" home >/dev/null 2>&1 || true
-      notify "Listo." "reply"
-      say_async "Listo."
+      notify "Listo." "reply"; say_async "Listo."
       return 0
     fi
-    if [[ "$lower" == *"enciende"* || "$lower" == *"encender"* || "$lower" == *"prende"* || "$lower" == *"prender"* ]]; then
+    if [[ "$lower" == *"enciende"* || "$lower" == *"encender"* \
+       || "$lower" == *"prende"* || "$lower" == *"prender"* ]]; then
       "$JARVIS_FREESTYLE" key power >/dev/null 2>&1 || true
-      notify "Encendiendo el proyector." "reply"
-      say_async "Encendiendo el proyector."
+      notify "Encendiendo el proyector." "reply"; say_async "Encendiendo el proyector."
       return 0
     fi
     if [[ "$lower" == *"apaga"* || "$lower" == *"apagar"* ]]; then
       "$JARVIS_FREESTYLE" off >/dev/null 2>&1 || true
-      notify "Apagando el proyector." "reply"
-      say_async "Apagando el proyector."
+      notify "Apagando el proyector." "reply"; say_async "Apagando el proyector."
       return 0
     fi
-    if [[ "$lower" == *"sube volumen"* || "$lower" == *"subir volumen"* ]]; then
+    if [[ "$lower" == *"sube volumen"* || "$lower" == *"subir volumen"* \
+       || "$lower" == *"súbele"* || "$lower" == *"subele"* ]]; then
       "$JARVIS_FREESTYLE" volup >/dev/null 2>&1 || true
-      notify "Subí el volumen del proyector." "reply"
-      say_async "Subí el volumen del proyector."
+      notify "Subí el volumen del proyector." "reply"; say_async "Subí el volumen del proyector."
       return 0
     fi
-    if [[ "$lower" == *"baja volumen"* || "$lower" == *"bajar volumen"* ]]; then
+    if [[ "$lower" == *"baja volumen"* || "$lower" == *"bajar volumen"* \
+       || "$lower" == *"bájale"* || "$lower" == *"bajale"* ]]; then
       "$JARVIS_FREESTYLE" voldown >/dev/null 2>&1 || true
-      notify "Bajé el volumen del proyector." "reply"
-      say_async "Bajé el volumen del proyector."
+      notify "Bajé el volumen del proyector." "reply"; say_async "Bajé el volumen del proyector."
       return 0
     fi
     if [[ "$lower" == *"silencio"* || "$lower" == *"mute"* ]]; then
       "$JARVIS_FREESTYLE" mute >/dev/null 2>&1 || true
-      notify "Alterné el silencio del proyector." "reply"
-      say_async "Alterné el silencio del proyector."
+      notify "Alterné el silencio del proyector." "reply"; say_async "Alterné el silencio del proyector."
       return 0
     fi
     if [[ "$lower" == *"pausa"* ]]; then
       "$JARVIS_FREESTYLE" key pausa >/dev/null 2>&1 || true
-      notify "Pausa." "reply"
-      say_async "Pausa."
+      notify "Pausa." "reply"; say_async "Pausa."
       return 0
     fi
     if [[ "$lower" == *"atrás"* || "$lower" == *"atras"* || "$lower" == *"regresa"* ]]; then
       "$JARVIS_FREESTYLE" key atras >/dev/null 2>&1 || true
-      notify "Listo." "reply"
-      say_async "Listo."
+      notify "Listo." "reply"; say_async "Listo."
       return 0
     fi
   fi
 
+  # ── Hora y fecha ──────────────────────────────────────────────────────────
   if [[ "$lower" == *"hora es"* || "$lower" == *"qué hora"* || "$lower" == *"que hora"* ]]; then
     local reply="Son las $(date '+%H:%M')."
-    notify "Jarvis: $reply" "reply"
-    say_async "$reply"
+    notify "Jarvis: $reply" "reply"; say_async "$reply"
     return 0
   fi
-
   if [[ "$lower" == *"fecha"* || "$lower" == *"qué día"* || "$lower" == *"que día"* ]]; then
     local reply="Hoy es $(LC_TIME=es_MX.UTF-8 date '+%A %d de %B de %Y' 2>/dev/null || date '+%d/%m/%Y')."
-    notify "Jarvis: $reply" "reply"
-    say_async "$reply"
+    notify "Jarvis: $reply" "reply"; say_async "$reply"
     return 0
   fi
 
-  if [[ "$lower" =~ (^|[[:space:]])(abre|abrir|abra|obra|ejecuta|inicia|lanza)([[:space:]]|$) ]]; then
+  # ── Abrir aplicaciones / sitios ───────────────────────────────────────────
+  # También interceptamos "busca en google X" y "googlea X" para abrir el navegador
+  # directamente sin pasar por el agente.
+  if [[ "$lower" =~ (^|[[:space:]])(abre|abrir|abra|obra|ejecuta|inicia|lanza|busca|buscar|googlea|google)([[:space:]]|$) ]]; then
     if [[ -x "$JARVIS_OPEN_APP" ]]; then
       local out
-      if out="$($JARVIS_OPEN_APP "$text" 2>/dev/null)"; then
+      if out="$("$JARVIS_OPEN_APP" "$text" 2>/dev/null)"; then
         notify "Jarvis: $out" "reply"
         say_async "$out"
         return 0
@@ -398,6 +459,7 @@ handle_local_command() {
     fi
   fi
 
+  # ── Captura de pantalla ───────────────────────────────────────────────────
   if [[ "$lower" == *"captura"* || "$lower" == *"screenshot"* || "$lower" == *"pantallazo"* ]]; then
     local shot="$HOME/Imágenes/captura-jarvis-$(date +%Y%m%d-%H%M%S).png"
     mkdir -p "$HOME/Imágenes"
@@ -407,82 +469,88 @@ handle_local_command() {
     return 0
   fi
 
-  if [[ "$lower" == *"bloquea pantalla"* || "$lower" == *"bloquear pantalla"* || "$lower" == *"bloquea la pantalla"* ]]; then
+  # ── Bloquear pantalla ─────────────────────────────────────────────────────
+  if [[ "$lower" == *"bloquea pantalla"* || "$lower" == *"bloquear pantalla"* \
+     || "$lower" == *"bloquea la pantalla"* ]]; then
     say_async "Bloqueando pantalla."
     [[ -x "$LOGINCTL" ]] && "$LOGINCTL" lock-session 2>/dev/null || true
     return 0
   fi
 
+  # ── Carpetas comunes ──────────────────────────────────────────────────────
   if [[ "$lower" == *"abre escritorio"* || "$lower" == *"abrir escritorio"* ]]; then
     [[ -x "$XDG_OPEN" ]] && "$XDG_OPEN" "$HOME/Escritorio" >/dev/null 2>&1 &
     say_async "Abriendo escritorio."
     return 0
   fi
-
   if [[ "$lower" == *"abre descargas"* || "$lower" == *"abrir descargas"* ]]; then
     [[ -x "$XDG_OPEN" ]] && "$XDG_OPEN" "$HOME/Descargas" >/dev/null 2>&1 &
     say_async "Abriendo descargas."
     return 0
   fi
 
-
-
+  # ── Volumen numérico (patrón alternativo) ─────────────────────────────────
   if [[ "$lower" =~ (pon|poner|sube|subir|baja|bajar).*volumen.*([0-9]{1,3}) ]]; then
     local level="${BASH_REMATCH[2]}"
-    if (( level < 0 )); then level=0; fi
-    if (( level > 100 )); then level=100; fi
+    (( level < 0   )) && level=0
+    (( level > 100 )) && level=100
     [[ -x "$WPCTL" ]] && "$WPCTL" set-volume @DEFAULT_AUDIO_SINK@ "${level}%" 2>/dev/null || true
     say_async "Volumen al ${level} por ciento."
     return 0
   fi
 
-  if [[ "$lower" == *"pausa musica"* || "$lower" == *"pausar musica"* || "$lower" == *"pausa la musica"* || "$lower" == *"pausa"* || "$lower" == *"reanuda"* || "$lower" == *"continua"* || "$lower" == *"continúa"* ]]; then
+  # ── Música (playerctl) ────────────────────────────────────────────────────
+  if [[ "$lower" == *"pausa musica"* || "$lower" == *"pausar musica"* \
+     || "$lower" == *"pausa la musica"* || "$lower" == *"pausa"* \
+     || "$lower" == *"reanuda"* || "$lower" == *"continua"* || "$lower" == *"continúa"* ]]; then
     command -v playerctl >/dev/null 2>&1 && playerctl play-pause >/dev/null 2>&1 || true
     say_async "Listo."
     return 0
   fi
-
-  if [[ "$lower" == *"siguiente cancion"* || "$lower" == *"siguiente canción"* || "$lower" == *"siguiente pista"* ]]; then
+  if [[ "$lower" == *"siguiente cancion"* || "$lower" == *"siguiente canción"* \
+     || "$lower" == *"siguiente pista"* || "$lower" == *"siguiente"* ]]; then
     command -v playerctl >/dev/null 2>&1 && playerctl next >/dev/null 2>&1 || true
     say_async "Siguiente."
     return 0
   fi
-
-  if [[ "$lower" == *"cancion anterior"* || "$lower" == *"canción anterior"* || "$lower" == *"pista anterior"* ]]; then
+  if [[ "$lower" == *"cancion anterior"* || "$lower" == *"canción anterior"* \
+     || "$lower" == *"pista anterior"* || "$lower" == *"anterior"* ]]; then
     command -v playerctl >/dev/null 2>&1 && playerctl previous >/dev/null 2>&1 || true
     say_async "Anterior."
     return 0
   fi
 
-  if [[ "$lower" == *"apaga monitor"* || "$lower" == *"apagar monitor"* || "$lower" == *"apaga la pantalla"* || "$lower" == *"apagar pantalla"* ]]; then
+  # ── Monitor / pantalla ────────────────────────────────────────────────────
+  if [[ "$lower" == *"apaga monitor"* || "$lower" == *"apagar monitor"* \
+     || "$lower" == *"apaga la pantalla"* || "$lower" == *"apagar pantalla"* \
+     || "$lower" == *"apaga pantalla"* ]]; then
     command -v xset >/dev/null 2>&1 && xset dpms force off >/dev/null 2>&1 || true
     say_async "Apagando pantalla."
     return 0
   fi
 
-  if [[ "$lower" == *"modo silencio"* || "$lower" == *"activa silencio"* || "$lower" == *"silencia todo"* ]]; then
+  # ── Silencio / mute del sistema ───────────────────────────────────────────
+  if [[ "$lower" == *"modo silencio"* || "$lower" == *"activa silencio"* \
+     || "$lower" == *"silencia todo"* ]]; then
     [[ -x "$WPCTL" ]] && "$WPCTL" set-mute @DEFAULT_AUDIO_SINK@ 1 2>/dev/null || true
     return 0
   fi
-
-  if [[ "$lower" == *"quita silencio"* || "$lower" == *"desactiva silencio"* || "$lower" == *"activa sonido"* ]]; then
+  if [[ "$lower" == *"quita silencio"* || "$lower" == *"desactiva silencio"* \
+     || "$lower" == *"activa sonido"* ]]; then
     [[ -x "$WPCTL" ]] && "$WPCTL" set-mute @DEFAULT_AUDIO_SINK@ 0 2>/dev/null || true
     say_async "Sonido activado."
     return 0
   fi
-
   if [[ "$lower" == *"sube volumen"* || "$lower" == *"subir volumen"* ]]; then
     [[ -x "$WPCTL" ]] && "$WPCTL" set-volume @DEFAULT_AUDIO_SINK@ 5%+ 2>/dev/null || true
     say_async "Subí el volumen."
     return 0
   fi
-
   if [[ "$lower" == *"baja volumen"* || "$lower" == *"bajar volumen"* ]]; then
     [[ -x "$WPCTL" ]] && "$WPCTL" set-volume @DEFAULT_AUDIO_SINK@ 5%- 2>/dev/null || true
     say_async "Bajé el volumen."
     return 0
   fi
-
   if [[ "$lower" == *"silencio"* || "$lower" == *"mute"* || "$lower" == *"silenciar"* ]]; then
     [[ -x "$WPCTL" ]] && "$WPCTL" set-mute @DEFAULT_AUDIO_SINK@ toggle 2>/dev/null || true
     say_async "Alterné el silencio."
@@ -491,25 +559,42 @@ handle_local_command() {
 
   return 1
 }
+
 ask_agent() {
   local message="$1"
   local idx="$2"
   local out_json="$WORKDIR/respuesta-$STAMP-$idx.json"
   [[ -f "$CANCEL_FLAG" ]] && return 130
-  if ! "$OPENCLAW" agent --agent main --message "$message" --json --timeout 180 >"$out_json" 2>"$ERR"; then
+  if ! "$OPENCLAW" agent --agent main --message "$message" \
+       --json --timeout 180 >"$out_json" 2>"$ERR"; then
     [[ -f "$CANCEL_FLAG" ]] && return 130
     echo ""
     return 1
   fi
   [[ -f "$CANCEL_FLAG" ]] && return 130
-  $JQ -r 'if (.result.payloads[0].text? // "") != "" then .result.payloads[0].text else ([.. | objects | .text? // empty] | join("\n")) end' "$out_json" | sed -E 's/\*\*//g; s/^-[[:space:]]*/• /'
+  $JQ -r 'if (.result.payloads[0].text? // "") != ""
+          then .result.payloads[0].text
+          else ([.. | objects | .text? // empty] | join("\n"))
+          end' "$out_json" \
+    | sed -E 's/\*\*//g; s/^-[[:space:]]*/• /'
 }
+
 needs_followup() {
   local reply="$1"
   local lower
   lower="$(printf '%s' "$reply" | tr '[:upper:]ÁÉÍÓÚÜÑ¿?' '[:lower:]áéíóúüñ  ')"
-  [[ "$reply" == *"?"* || "$reply" == *"¿"* || "$lower" == *"te refieres"* || "$lower" == *"quieres que"* || "$lower" == *"necesito que me confirmes"* || "$lower" == *"puedes confirmar"* ]]
+  # Solo consideramos seguimiento si la pregunta está al FINAL de la respuesta.
+  # Evita falsos positivos en respuestas informativas que usan "¿…?" internamente.
+  local last_sentence
+  last_sentence="$(printf '%s' "$lower" | grep -oE '[^.!]+$' | head -n 1 || true)"
+  [[ "$last_sentence" == *"?"* \
+  || "$last_sentence" == *"te refieres"* \
+  || "$last_sentence" == *"quieres que"* \
+  || "$last_sentence" == *"puedes confirmar"* \
+  || "$last_sentence" == *"necesito saber"* ]]
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
@@ -517,6 +602,7 @@ if ! flock -n 9; then
   exit 0
 fi
 
+# ── Obtener texto del comando ─────────────────────────────────────────────────
 if [[ -n "${JARVIS_PREFILLED_TEXT:-}" ]]; then
   TEXT="$(clean_command "$JARVIS_PREFILLED_TEXT")"
 elif [[ "${1:-}" == "--text" && -n "${2:-}" ]]; then
@@ -525,6 +611,7 @@ elif [[ "${1:-}" == "--text" && -n "${2:-}" ]]; then
 else
   TEXT="$(listen_once inicial "$DURATION" || true)"
 fi
+
 if [[ -z "${TEXT// }" ]]; then
   notify "No entendí la instrucción." "error"
   say_async "No entendí."
@@ -536,13 +623,16 @@ if handle_local_command "$TEXT"; then
   exit 0
 fi
 
+# Verificación de cancel antes de consultar al agente.
+[[ -f "$CANCEL_FLAG" ]] && exit 130
+
 notify "Procesando…" "processing"
-# Respuesta en dos fases para consultas que sí requieren OpenAI/OpenClaw:
-# feedback inmediato para que no se sienta congelado, y luego respuesta final.
 say_async "Lo reviso."
+
 MESSAGE="$TEXT"
 for i in $(seq 0 "$MAX_FOLLOWUPS"); do
   REPLY="$(ask_agent "$MESSAGE" "$i" || true)"
+
   if [[ -f "$CANCEL_FLAG" ]]; then
     exit 130
   fi
@@ -564,6 +654,8 @@ for i in $(seq 0 "$MAX_FOLLOWUPS"); do
     say_async "No escuché respuesta. Cancelo el seguimiento."
     exit 0
   fi
+
+  [[ -f "$CANCEL_FLAG" ]] && exit 130
   notify "Seguimiento: $FOLLOWUP" "listening"
 
   if handle_local_command "$FOLLOWUP"; then

@@ -4,10 +4,13 @@ import json, re, sys, unicodedata
 raw = ' '.join(sys.argv[1:]).strip()
 
 def strip_accents(s):
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', s)
+        if unicodedata.category(c) != 'Mn'
+    )
 
 def norm(s):
-    s = s.lower().replace('¿',' ').replace('?',' ')
+    s = s.lower().replace('¿', ' ').replace('?', ' ')
     s = strip_accents(s)
     s = re.sub(r'[^a-z0-9% ]+', ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
@@ -18,48 +21,99 @@ t = norm(raw)
 t = re.sub(r'^(oye\s+)?(jarvis|llaves|llave|para la llave)\s+', '', t).strip()
 t = re.sub(r'^(por favor|oye|a ver)\s+', '', t).strip()
 
+# ── Stop ─────────────────────────────────────────────────────────────────────
 STOP_PATTERNS = [
     r'^(para|parate|detente|alto|stop)$',
-    r'^(callate|silencio|ya callate)$',
-    r'^(cancela|cancelar|cancelalo|olvidalo|ya no)$',
+    r'^(callate|silencio jarvis|ya callate|calla)$',
+    r'^(cancela|cancelar|cancelalo|olvidalo|ya no|olvida)$',
+    r'^(basta|ya basta|ya para|espera|hasta aqui)$',
     r'^(deja de escuchar|deja de hablar|no escuches|ya no escuches)$',
     r'^(para jarvis|jarvis para|detente jarvis|callate jarvis)$',
 ]
 if any(re.search(p, t) for p in STOP_PATTERNS):
-    print(json.dumps({'handled': True, 'domain': 'jarvis', 'action': 'stop', 'confidence': 0.98, 'say': 'Me detengo.'}, ensure_ascii=False))
+    print(json.dumps(
+        {'handled': True, 'domain': 'jarvis', 'action': 'stop',
+         'confidence': 0.98, 'say': 'Me detengo.'},
+        ensure_ascii=False,
+    ))
     sys.exit(0)
 
-# Errores típicos del STT para proyector/freestyle/cine.
+# ── Detección del dispositivo ─────────────────────────────────────────────────
+# Palabras que Vosk suele transcribir cuando el usuario dice "proyector" o "Freestyle".
 device_words = {
-    'cine','cinema','proyector','proyecto','proyectos','director','productor','protector','freestyle','free style','fris','frizz',
-    'cristo','cristal','rupturista','the freestyle','frestail','fristail','freesail'
+    'cine', 'cinema',
+    'proyector', 'proyecto', 'proyectos', 'proyectar', 'proyeccion',
+    'director', 'productor', 'protector',
+    'freestyle', 'free style', 'fris', 'frizz',
+    'cristo', 'cristal', 'rupturista',
+    'the freestyle', 'frestail', 'fristail', 'freesail',
+    'frestyle', 'frestil',
 }
-# Normaliza variantes compuestas.
-t2 = t.replace('free style', 'freestyle').replace('the freestyle', 'freestyle')
-words = set(t2.split())
-has_device = bool(words & {w for w in device_words if ' ' not in w}) or any(w in t for w in device_words if ' ' in w)
 
-# Si menciona apps con “en/ del/ al” y un falso proyector, también cuenta.
-apps = {'youtube': 'youtube', 'you tube': 'youtube', 'yutub': 'youtube', 'netflix': 'netflix', 'net flix': 'netflix', 'prime': 'prime', 'prime video': 'prime video', 'disney': 'disney+', 'disney plus': 'disney+'}
+# Normaliza variantes compuestas antes de buscar.
+t2 = (t
+      .replace('free style', 'freestyle')
+      .replace('the freestyle', 'freestyle'))
+
+words = set(t2.split())
+has_device = (
+    bool(words & {w for w in device_words if ' ' not in w})
+    or any(w in t2 for w in device_words if ' ' in w)
+)
+
+# ── Apps que se pueden abrir en el proyector ──────────────────────────────────
+apps = {
+    'youtube':    'youtube',
+    'you tube':   'youtube',
+    'yutub':      'youtube',
+    'netflix':    'netflix',
+    'net flix':   'netflix',
+    'prime':      'prime video',
+    'prime video':'prime video',
+    'disney':     'disney+',
+    'disney plus':'disney+',
+    'disney+':    'disney+',
+    'max':        'max',
+    'hbo':        'max',
+    'hbo max':    'max',
+    'paramount':  'paramount+',
+}
 app = None
 for k, v in apps.items():
     if k in t2:
-        app = v; break
+        app = v
+        break
 
-# Para evitar robar comandos globales, casi todo de Freestyle exige dispositivo o app+preposición.
-mentions_projector_context = has_device or (app and re.search(r'\b(en|al|del|sobre)\b', t2))
+# Para evitar robar comandos globales, casi todo de Freestyle exige dispositivo
+# o app + preposición que indique destino.
+mentions_projector_context = has_device or (
+    app and re.search(r'\b(en|al|del|sobre|para el|en el)\b', t2)
+)
+
 if mentions_projector_context:
-    action = None; args = {}
-    # Apps primero.
+    action = None
+    args   = {}
+
+    # Apps primero (más específico).
     if app:
-        action = 'open_app'; args['app'] = app
+        action      = 'open_app'
+        args['app'] = app
+
+    # Búsqueda en YouTube en el proyector.
+    elif m := re.search(r'\b(?:busca|buscar|pon|reproduce)\b\s+(?:en\s+youtube\s+)?(.+)', t2):
+        query = m.group(1).strip()
+        # Filtra artefactos cortos del STT.
+        if len(query) >= 3:
+            action       = 'search_youtube'
+            args['query'] = query
+
     elif re.search(r'\b(apaga|apagar|apagalo|apague|desconecta)\b', t2):
         action = 'power_off'
     elif re.search(r'\b(enciende|encender|prende|prender|prendelo|activa)\b', t2):
         action = 'power_on'
     elif re.search(r'\b(home|inicio|principal|menu)\b', t2):
         action = 'home'
-    elif re.search(r'\b(regresa|regresar|atras|volver|vuelve)\b', t2):
+    elif re.search(r'\b(regresa|regresar|atras|volver|vuelve|back)\b', t2):
         action = 'back'
     elif re.search(r'\b(acepta|ok|enter|selecciona|dale|presiona)\b', t2):
         action = 'enter'
@@ -71,19 +125,31 @@ if mentions_projector_context:
         action = 'left'
     elif re.search(r'\b(derecha)\b', t2):
         action = 'right'
-    elif re.search(r'\b(mute|silencio|silencia|calla|quitar sonido|sin sonido)\b', t2):
+    elif re.search(r'\b(mute|silencio|silencia|calla|sin sonido|quitar sonido)\b', t2):
         action = 'mute'
     elif re.search(r'\b(pausa|pausar|deten|detener|pause)\b', t2):
         action = 'pause'
-    elif re.search(r'\b(reanuda|continua|continua|play|reproduce|seguir)\b', t2):
+    elif re.search(r'\b(reanuda|continua|play|reproduce|seguir)\b', t2):
         action = 'play'
-    elif re.search(r'\b(sube|subir|subele|aumenta|mas|incrementa)\b.*\b(volumen|audio|sonido)\b|\b(subele|subele)\b|\b(volumen|audio|sonido)\b.*\b(arriba|mas)\b', t2):
+    elif re.search(
+        r'\b(sube|subir|subele|aumenta|mas|incrementa)\b.*\b(volumen|audio|sonido)\b'
+        r'|\b(subele)\b'
+        r'|\b(volumen|audio|sonido)\b.*\b(arriba|mas)\b', t2,
+    ):
         action = 'volume_up'
-    elif re.search(r'\b(baja|bajar|bajale|disminuye|menos|reduce)\b.*\b(volumen|audio|sonido)\b|\b(bajale|bajale)\b|\b(volumen|audio|sonido)\b.*\b(abajo|menos)\b', t2):
+    elif re.search(
+        r'\b(baja|bajar|bajale|disminuye|menos|reduce)\b.*\b(volumen|audio|sonido)\b'
+        r'|\b(bajale)\b'
+        r'|\b(volumen|audio|sonido)\b.*\b(abajo|menos)\b', t2,
+    ):
         action = 'volume_down'
 
     if action:
-        print(json.dumps({'handled': True, 'domain': 'freestyle', 'action': action, 'args': args, 'confidence': 0.92, 'normalized': t2}, ensure_ascii=False))
+        print(json.dumps(
+            {'handled': True, 'domain': 'freestyle', 'action': action,
+             'args': args, 'confidence': 0.92, 'normalized': t2},
+            ensure_ascii=False,
+        ))
         sys.exit(0)
 
 print(json.dumps({'handled': False, 'normalized': t2}, ensure_ascii=False))

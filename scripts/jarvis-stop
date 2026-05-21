@@ -1,23 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/jarvis-voz"
 TTS_DIR="${XDG_RUNTIME_DIR:-/tmp}/jarvis-tts"
 OVERLAY="/home/leonardo/.local/bin/jarvis-overlay"
 mkdir -p "$STATE_DIR" "$TTS_DIR"
 
-# Cortar voz/procesamiento actual de Jarvis. Patrones específicos para no matar audio normal del sistema.
+# 1. Señal de cancelación para jarvis-voz en curso.
 touch "$STATE_DIR/cancel.flag" 2>/dev/null || true
-pkill -f '/home/leonardo/.local/bin/jarvis-say' 2>/dev/null || true
-pkill -f '/home/leonardo/.local/bin/edge-tts' 2>/dev/null || true
-pkill -f 'aplay -q .*/jarvis-.*\.wav' 2>/dev/null || true
-pkill -f 'spd-say .*' 2>/dev/null || true
-# Si Jarvis estaba esperando una respuesta del agente por voz, córtala también.
+
+# 2. Cortar TTS: jarvis-say, edge-tts y aplay específicamente de Jarvis.
+#    Usamos --exact donde es seguro para no matar procesos del sistema.
+pkill -f '/home/leonardo/.local/bin/jarvis-say'  2>/dev/null || true
+pkill -f '/home/leonardo/.local/bin/edge-tts'    2>/dev/null || true
+# aplay: solo el que esté reproduciendo un WAV temporal de Jarvis.
+pkill -f "aplay -q ${TTS_DIR}/jarvis-"           2>/dev/null || true
+
+# 3. Cortar speech-dispatcher SOLO para Jarvis (no matar el daemon global).
+#    spd-say no tiene flag --exact útil, así que usamos el PID del speaking.lock si es spd-say.
+SPEAKING_LOCK="$STATE_DIR/speaking.lock"
+if [[ -s "$SPEAKING_LOCK" ]]; then
+  lock_pid="$(cat "$SPEAKING_LOCK" 2>/dev/null || true)"
+  if [[ -n "${lock_pid:-}" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    # Verificamos que el proceso sea realmente jarvis-say o spd-say antes de matar.
+    proc_name="$(ps -p "$lock_pid" -o comm= 2>/dev/null || true)"
+    if [[ "$proc_name" == "jarvis-say" || "$proc_name" == "spd-say" \
+       || "$proc_name" == "aplay" || "$proc_name" == "edge-tts" ]]; then
+      kill "$lock_pid" 2>/dev/null || true
+    fi
+  fi
+fi
+
+# 4. Cancelar consulta OpenClaw en vuelo.
 pkill -f '/home/leonardo/.npm-global/bin/openclaw agent --agent main' 2>/dev/null || true
+
+# 5. Detener cualquier instancia de jarvis-voz esperando respuesta del agente.
+#    No matamos la instancia que disparó jarvis-stop (ya terminó o es otra).
+pkill -f '/home/leonardo/.local/bin/jarvis-voz' 2>/dev/null || true
+
+# 6. Silenciar speech-dispatcher globalmente (para el fallback spd-say si quedó activo).
 command -v spd-say >/dev/null 2>&1 && spd-say -S >/dev/null 2>&1 || true
 
-rm -f "$STATE_DIR/speaking.lock" 2>/dev/null || true
+# 7. Limpiar archivos temporales de TTS para no acumular basura.
+find "$TTS_DIR" -name 'jarvis-*.wav' -o -name 'jarvis-*.mp3' 2>/dev/null \
+  | xargs rm -f 2>/dev/null || true
 
-# Limpiar estado visual si existe overlay.
+# 8. Limpiar lock de voz.
+rm -f "$SPEAKING_LOCK" 2>/dev/null || true
+
+# 9. Actualizar HUD.
 if [[ -x "$OVERLAY" ]]; then
   "$OVERLAY" --state reply "Cancelado." >/dev/null 2>&1 || true
 fi

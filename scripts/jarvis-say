@@ -15,25 +15,51 @@ STAMP="$(date +%Y%m%d-%H%M%S-%N)"
 MP3="$WORKDIR/jarvis-$STAMP.mp3"
 WAV="$WORKDIR/jarvis-$STAMP.wav"
 SPEAKING_LOCK="$STATE_DIR/speaking.lock"
+MAX_TTS_RETRIES=3
 
-touch "$SPEAKING_LOCK" 2>/dev/null || true
-cleanup() { rm -f "$MP3" "$WAV" "$SPEAKING_LOCK" 2>/dev/null || true; }
+# El lock se escribe con PID para que jarvis-stop pueda verificar si el proceso sigue vivo.
+echo "$$" > "$SPEAKING_LOCK" 2>/dev/null || true
+
+cleanup() {
+  rm -f "$MP3" "$WAV" 2>/dev/null || true
+  # Solo borramos el lock si sigue siendo nuestro (evita borrar el de otro proceso).
+  local lock_pid
+  lock_pid="$(cat "$SPEAKING_LOCK" 2>/dev/null || true)"
+  if [[ "${lock_pid:-}" == "$$" ]]; then
+    rm -f "$SPEAKING_LOCK" 2>/dev/null || true
+  fi
+}
 trap cleanup EXIT
 
+# ── Microsoft Edge TTS con reintentos ─────────────────────────────────────────
 if [[ -x "$EDGE_TTS" && -x "$FFMPEG" && -x "$APLAY" ]]; then
-  if "$EDGE_TTS" \
-      --voice es-ES-AlvaroNeural \
-      --rate '+4%' \
-      --pitch '-20Hz' \
-      --text "$TEXT" \
-      --write-media "$MP3" >/dev/null 2>&1; then
-    if "$FFMPEG" -y -hide_banner -loglevel error -i "$MP3" -ar 24000 -ac 1 "$WAV" >/dev/null 2>&1; then
-      "$APLAY" -q "$WAV" 2>/dev/null && exit 0
+  attempt=0
+  while (( attempt < MAX_TTS_RETRIES )); do
+    (( attempt++ )) || true
+    if "$EDGE_TTS" \
+        --voice es-ES-AlvaroNeural \
+        --rate '+4%' \
+        --pitch '-20Hz' \
+        --text "$TEXT" \
+        --write-media "$MP3" >/dev/null 2>&1; then
+      if "$FFMPEG" -y -hide_banner -loglevel error \
+          -i "$MP3" -ar 24000 -ac 1 "$WAV" >/dev/null 2>&1; then
+        if "$APLAY" -q "$WAV" 2>/dev/null; then
+          exit 0
+        fi
+      fi
+      # Conversión o reproducción fallida: no tiene sentido reintentar edge-tts.
+      break
     fi
-  fi
+    # edge-tts falló (probablemente error de red). Esperamos antes de reintentar.
+    if (( attempt < MAX_TTS_RETRIES )); then
+      sleep $(( attempt ))   # 1 s, 2 s entre intentos
+      rm -f "$MP3" "$WAV" 2>/dev/null || true
+    fi
+  done
 fi
 
-# Fallback, solo si falla la voz Microsoft.
+# ── Fallback: spd-say (solo si edge-tts falla por completo) ──────────────────
 if [[ -x "$SPD_SAY" ]]; then
   "$SPD_SAY" -l es -r 5 -p -25 "$TEXT" >/dev/null 2>&1 || true
 fi
