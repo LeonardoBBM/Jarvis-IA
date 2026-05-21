@@ -42,7 +42,7 @@ fi
 
 if [[ -z "$running" ]]; then
 python3 - "$STATEFILE" "$PIDFILE" "$RUNTIME_DIR" <<'PY' >/dev/null 2>"$RUNTIME_DIR/overlay-error.log" &
-import json, math, os, sys, time, warnings
+import json, math, os, subprocess, sys, time, warnings
 from pathlib import Path
 import cairo
 
@@ -51,6 +51,7 @@ statefile = Path(sys.argv[1])
 pidfile = Path(sys.argv[2])
 runtime_dir = Path(sys.argv[3])
 speaking_lock = runtime_dir / 'speaking.lock'
+jarvis_stop = Path('/home/leonardo/.local/bin/jarvis-stop')
 
 import gi
 gi.require_foreign('cairo')
@@ -66,6 +67,7 @@ PROFILES = {
 DEFAULT_STATE = {'state': 'reply', 'msg': '', 'updated_at': time.time(), 'expires_at': time.time() + 2.8}
 MAX_STICKY_SECONDS = 18
 MAX_PROCESSING_SECONDS = 180
+CANCEL_BUTTON_SIZE = 34
 
 def read_state():
     try:
@@ -123,6 +125,41 @@ class RingCanvas(Gtk.DrawingArea):
         self.color(cr, alpha)
         cr.arc(cx, cy, r, 0, math.tau)
         cr.stroke()
+
+    def draw_voice_waves(self, cr, cx, cy, p, glow):
+        # Modo voz: ondas simuladas mientras existe speaking.lock. Ligero, sin capturar audio real.
+        speaking = speaking_lock.exists()
+        if not speaking:
+            return
+
+        r, g, b = self.profile['rgb']
+        # Ondas circulares suaves que nacen del núcleo.
+        for idx in range(4):
+            wave = (p * 34 + idx * 22) % 88
+            alpha = max(0.0, 0.34 - wave / 260) * glow
+            cr.set_source_rgba(r, g, b, alpha)
+            cr.set_line_width(2.2)
+            cr.arc(cx, cy, 64 + wave, 0, math.tau)
+            cr.stroke()
+
+        # Ecualizador central: se mueve con la fase de habla de Jarvis.
+        bars = 17
+        spacing = 9
+        base_y = cy + 104
+        total_w = (bars - 1) * spacing
+        start_x = cx - total_w / 2
+        cr.set_line_cap(1)
+        for i in range(bars):
+            amp = 0.35 + 0.65 * abs(math.sin(p * 2.7 + i * 0.78))
+            amp *= 0.78 + 0.22 * math.sin(p * 5.1 + i)
+            h = 12 + amp * 48
+            x = start_x + i * spacing
+            alpha = (0.35 + amp * 0.55) * glow
+            cr.set_line_width(4.2 if i % 2 else 3.2)
+            cr.set_source_rgba(min(r * 1.2, 1), min(g * 1.2, 1), min(b * 1.2, 1), alpha)
+            cr.move_to(x, base_y - h / 2)
+            cr.line_to(x, base_y + h / 2)
+            cr.stroke()
 
     def on_draw(self, area, cr):
         w = area.get_allocated_width()
@@ -187,6 +224,8 @@ class RingCanvas(Gtk.DrawingArea):
         self.color(cr, 1.0, 1.2)
         cr.arc(cx, cy, 7 + pulse * 2.3, 0, math.tau)
         cr.fill()
+
+        self.draw_voice_waves(cr, cx, cy, p, glow)
         return False
 
 class JarvisHud(Gtk.Window):
@@ -207,7 +246,25 @@ class JarvisHud(Gtk.Window):
             self.set_visual(visual)
 
         provider = Gtk.CssProvider()
-        provider.load_from_data(b'window { background: transparent; } #root { background: transparent; }')
+        provider.load_from_data(b'''
+            window { background: transparent; }
+            #root { background: transparent; }
+            #cancel-button {
+                background: rgba(0, 28, 42, 0.18);
+                color: rgba(170, 255, 255, 0.48);
+                border: 1px solid rgba(130, 245, 255, 0.22);
+                border-radius: 17px;
+                box-shadow: none;
+                padding: 0;
+                font-weight: bold;
+                font-size: 16px;
+            }
+            #cancel-button:hover {
+                background: rgba(255, 70, 50, 0.30);
+                color: rgba(255, 245, 240, 0.92);
+                border-color: rgba(255, 110, 90, 0.55);
+            }
+        ''')
         Gtk.StyleContext.add_provider_for_screen(screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         overlay = Gtk.Overlay()
@@ -215,7 +272,33 @@ class JarvisHud(Gtk.Window):
         self.add(overlay)
         self.canvas = RingCanvas()
         overlay.add(self.canvas)
+
+        self.cancel_button = Gtk.Button(label='×')
+        self.cancel_button.set_name('cancel-button')
+        self.cancel_button.set_tooltip_text('Cancelar Jarvis')
+        self.cancel_button.set_size_request(CANCEL_BUTTON_SIZE, CANCEL_BUTTON_SIZE)
+        self.cancel_button.set_opacity(0.42)
+        self.cancel_button.set_halign(Gtk.Align.END)
+        self.cancel_button.set_valign(Gtk.Align.START)
+        self.cancel_button.set_margin_top(8)
+        self.cancel_button.set_margin_end(8)
+        self.cancel_button.connect('clicked', self.cancel_jarvis)
+        overlay.add_overlay(self.cancel_button)
+
         self.connect('destroy', Gtk.main_quit)
+
+    def cancel_jarvis(self, *_):
+        try:
+            if jarvis_stop.exists():
+                subprocess.Popen([str(jarvis_stop)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+            else:
+                statefile.write_text(json.dumps({
+                    'state': 'error', 'msg': 'jarvis-stop no encontrado',
+                    'updated_at': time.time(), 'expires_at': time.time() + 2.8,
+                }, ensure_ascii=False), encoding='utf-8')
+        except Exception:
+            pass
+        GLib.timeout_add(250, Gtk.main_quit)
 
     def place(self):
         self.show_all()

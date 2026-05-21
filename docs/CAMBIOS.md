@@ -133,3 +133,13 @@ a claves más específicas (`"google maps"` antes que `"maps"`).
   una búsqueda. Requiere que `jarvis-intent` emita `action=search_youtube`.
 - Apps nuevas: `max` / `hbo`, `paramount+`.
 - `WS_RETRY_ATTEMPTS` y `WS_RETRY_DELAY` son constantes fácilmente ajustables.
+
+---
+
+## jarvis-overlay — 2026-05-21
+
+### Mejoras
+- Botón discreto de cancelar (`×`) en la esquina superior derecha del HUD.
+- El botón ejecuta `~/.local/bin/jarvis-stop` para cortar TTS, consulta OpenClaw y estado de voz.
+- Animación tipo ondas/ecualizador cuando Jarvis está hablando, detectada por `speaking.lock`.
+- Las ondas son ligeras y no capturan audio real; solo reflejan el estado de habla de Jarvis.
