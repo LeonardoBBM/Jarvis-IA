@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OPENCLAW="/home/leonardo/.npm-global/bin/openclaw"
+JQ="/usr/bin/jq"
+ARECORD="/usr/bin/arecord"
+AMIXER="/usr/bin/amixer"
+FFMPEG="/home/leonardo/.local/bin/ffmpeg"
+VOSK_TRANSCRIBE="/home/leonardo/.local/bin/oye-jarvis-transcribe-vosk"
+
+CHAT_TARGET="1384796244"
+CHANNEL="telegram"
+DURATION="4"
+LANGUAGE="es"
+STT_MODEL="openai/gpt-4o-transcribe"
+CAPTURE_VOLUME="30%"
+WORKDIR="${XDG_RUNTIME_DIR:-/tmp}/oye-jarvis"
+mkdir -p "$WORKDIR"
+LOCKFILE="$WORKDIR/oye-jarvis.lock"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+AUDIO="$WORKDIR/comando-$STAMP.wav"
+CLEAN_AUDIO="$WORKDIR/comando-$STAMP-limpio.wav"
+JSON="$WORKDIR/transcripcion-$STAMP.json"
+ERR="$WORKDIR/error.log"
+PROMPT="Transcribe únicamente en español de México. El usuario probablemente dirá una instrucción corta para Jarvis. Si al inicio escucha algo parecido a 'oye Jarvis', 'Jarvis', 'para la llave', 'oye llaves' o una frase rara antes del comando, ignórala como palabra de activación. Devuelve solo la instrucción real, por ejemplo: 'qué hora es', 'abre tal cosa', 'ayúdame con esto'. No traduzcas al inglés."
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Jarvis" "$1" || true
+  fi
+}
+
+alert() {
+  notify "$1"
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --error --title="Jarvis" --text="$1" 2>/dev/null || true
+  fi
+}
+
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+  notify "Ya estoy escuchando o esperando confirmación. Cierra la ventana anterior o espera a que termine."
+  exit 0
+fi
+
+notify "Te escucho durante ${DURATION} segundos..."
+
+if [[ ! -x "$OPENCLAW" ]]; then
+  alert "No encuentro OpenClaw en $OPENCLAW."
+  exit 1
+fi
+
+if [[ -x "$AMIXER" ]]; then
+  "$AMIXER" -q set Capture "$CAPTURE_VOLUME" cap 2>/dev/null || true
+fi
+
+if ! timeout $((DURATION + 3)) "$ARECORD" -q -f S16_LE -r 16000 -c 1 -t wav -d "$DURATION" "$AUDIO" 2>"$ERR"; then
+  alert "No pude grabar audio. Revisa el micrófono."
+  exit 1
+fi
+
+if [[ -x "$FFMPEG" ]]; then
+  "$FFMPEG" -y -hide_banner -loglevel error -i "$AUDIO" -af "highpass=f=80,lowpass=f=7600,afftdn=nf=-25,dynaudnorm=f=150:g=8" -ar 16000 -ac 1 "$CLEAN_AUDIO" 2>"$ERR" || cp "$AUDIO" "$CLEAN_AUDIO"
+else
+  cp "$AUDIO" "$CLEAN_AUDIO"
+fi
+
+notify "Transcribiendo tu instrucción..."
+TEXT=""
+if [[ -x "$VOSK_TRANSCRIBE" ]]; then
+  TEXT="$($VOSK_TRANSCRIBE "$CLEAN_AUDIO" 2>"$ERR" | sed '/^[[:space:]]*$/d' | head -n 1 || true)"
+  printf '{"engine":"vosk-local","text":%s}\n' "$($JQ -Rn --arg t "$TEXT" '$t')" >"$JSON" 2>/dev/null || true
+fi
+
+# Si el transcriptor local no entiende nada, usa la nube como respaldo.
+if [[ -z "${TEXT// }" ]]; then
+  if ! "$OPENCLAW" capability audio transcribe --file "$CLEAN_AUDIO" --language "$LANGUAGE" --model "$STT_MODEL" --prompt "$PROMPT" --json >"$JSON" 2>"$ERR"; then
+    alert "No pude transcribir el audio. Intenta hablar más cerca o revisa conexión/modelo."
+    exit 1
+  fi
+  TEXT="$($JQ -r '.. | objects | (.text? // .transcript? // .content? // empty)' "$JSON" | sed '/^[[:space:]]*$/d' | head -n 1)"
+fi
+if [[ -z "${TEXT// }" || "$TEXT" == "null" ]]; then
+  alert "No detecté texto claro en el audio."
+  exit 1
+fi
+
+# Limpieza ligera para comandos cortos: elimina falsos positivos de la frase de activación.
+TEXT="$(printf '%s' "$TEXT" | sed -E 's/^[Pp]ara la llave,?[[:space:]]*//; s/^[Oo]ye[[:space:]]+[Jj]arvis,?[[:space:]]*//; s/^[Jj]arvis,?[[:space:]]*//')"
+LOWER="$(printf '%s' "$TEXT" | tr '[:upper:]ÁÉÍÓÚÜÑ¿?' '[:lower:]áéíóúüñ  ')"
+if [[ "$LOWER" == *"hora es"* || "$LOWER" == *"qué hora"* || "$LOWER" == *"que hora"* ]]; then
+  TEXT="¿Qué hora es?"
+fi
+
+if command -v zenity >/dev/null 2>&1; then
+  EDITED="$(zenity --entry --title="Jarvis escuchó" --text="Revisa o edita la instrucción antes de enviarla:" --entry-text="$TEXT" 2>/dev/null || true)"
+  if [[ -z "${EDITED// }" ]]; then
+    notify "Cancelado."
+    exit 0
+  fi
+  TEXT="$EDITED"
+fi
+
+notify "Enviando a Jarvis..."
+if "$OPENCLAW" agent --channel "$CHANNEL" --to "$CHAT_TARGET" --message "$TEXT" --deliver >/dev/null 2>"$ERR"; then
+  notify "Instrucción enviada."
+else
+  alert "No pude enviar la instrucción a Jarvis. Revisa OpenClaw."
+  exit 1
+fi

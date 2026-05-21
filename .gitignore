@@ -1,0 +1,23 @@
+# Secretos/config local
+config/*.json
+config/*password*
+config/*credential*
+config/*token*
+.env
+*.key
+*.pem
+
+# Backups y temporales
+backups/
+*.backup-*
+*.bak
+*.tmp
+*.log
+__pycache__/
+*.pyc
+
+# Audio/runtime
+*.wav
+*.mp3
+*.aac
+current-state/

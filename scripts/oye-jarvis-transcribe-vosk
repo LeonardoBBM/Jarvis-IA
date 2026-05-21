@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+import json, sys, wave
+from pathlib import Path
+from vosk import Model, KaldiRecognizer, SetLogLevel
+
+SetLogLevel(-1)
+MODEL = Path('/home/leonardo/.local/share/oye-jarvis/models/vosk-model-small-es-0.42')
+if len(sys.argv) < 2:
+    print('', end='')
+    sys.exit(2)
+path = sys.argv[1]
+wf = wave.open(path, 'rb')
+if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
+    print('', end='')
+    sys.exit(3)
+model = Model(str(MODEL))
+rec = KaldiRecognizer(model, wf.getframerate())
+rec.SetWords(False)
+parts = []
+while True:
+    data = wf.readframes(4000)
+    if not data:
+        break
+    if rec.AcceptWaveform(data):
+        res = json.loads(rec.Result())
+        if res.get('text'):
+            parts.append(res['text'])
+res = json.loads(rec.FinalResult())
+if res.get('text'):
+    parts.append(res['text'])
+text = ' '.join(parts).strip()
+print(text)

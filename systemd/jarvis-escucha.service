@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarvis wake word listener
+After=graphical-session.target sound.target
+
+[Service]
+Type=simple
+ExecStart=/home/leonardo/.local/bin/jarvis-escucha
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

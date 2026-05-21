@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+
+import numpy as np
+from vosk import Model as VoskModel, KaldiRecognizer, SetLogLevel
+
+SetLogLevel(-1)
+try:
+    import openwakeword
+    from openwakeword.model import Model as WakeModel
+    OPENWAKEWORD_AVAILABLE = True
+except Exception:
+    OPENWAKEWORD_AVAILABLE = False
+
+VOSK_MODEL_DIR = Path('/home/leonardo/.local/share/oye-jarvis/models/vosk-model-small-es-0.42')
+JARVIS_VOZ = '/home/leonardo/.local/bin/jarvis-voz'
+JARVIS_STOP = '/home/leonardo/.local/bin/jarvis-stop'
+ARECORD = '/usr/bin/arecord'
+AMIXER = '/usr/bin/amixer'
+SPEAKING_LOCK = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp')) / 'jarvis-voz' / 'speaking.lock'
+# Sensibilidad del wake word. Más alto = menos falsos positivos.
+OPENWAKEWORD_THRESHOLD = 0.60
+REQUIRE_VOSK_OYE = True
+
+running = True
+
+def stop(*_):
+    global running
+    running = False
+
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGTERM, stop)
+
+WAKE_GRAMMAR = [
+    # Wake word + comandos frecuentes. Esto permite ejecutar “Oye Jarvis, pon volumen al 30”
+    # sin abrir una segunda ventana de escucha.
+    'oye jarvis', 'oye llaves', 'oye llave', 'jarvis',
+    'oye jarvis para', 'oye jarvis detente', 'oye jarvis cancela', 'oye jarvis silencio', 'oye jarvis callate',
+    'jarvis para', 'jarvis detente', 'jarvis cancela', 'jarvis silencio', 'jarvis callate',
+    'oye jarvis pon volumen al treinta', 'oye jarvis pon volumen al cincuenta', 'oye jarvis pon volumen al cien',
+    'oye jarvis sube volumen', 'oye jarvis baja volumen', 'oye jarvis sube tantito', 'oye jarvis baja tantito',
+    'oye jarvis abre youtube', 'oye jarvis abre firefox', 'oye jarvis abre descargas', 'oye jarvis abre escritorio',
+    'oye jarvis que hora es', 'oye jarvis como estas', 'oye jarvis gracias',
+    'cero', 'uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete', 'ocho', 'nueve', 'diez',
+    'veinte', 'treinta', 'cuarenta', 'cincuenta', 'sesenta', 'setenta', 'ochenta', 'noventa', 'cien',
+    '[unk]'
+]
+
+def new_vosk_recognizer(model):
+    rec = KaldiRecognizer(model, 16000, json.dumps(WAKE_GRAMMAR, ensure_ascii=False))
+    rec.SetWords(False)
+    return rec
+
+def norm(s):
+    s = s.lower()
+    table = str.maketrans('áéíóúüñ', 'aeiouun')
+    return s.translate(table)
+
+def stop_detected_vosk(text):
+    t = norm(text)
+    compact = ''.join(ch for ch in t if ch.isalnum())
+    has_name = any(x in t for x in ['jarvis', 'llave', 'llaves']) or any(x in compact for x in ['jarvis','llave','llaves'])
+    has_stop = any(x in t for x in ['para', 'detente', 'cancela', 'cancelar', 'silencio', 'callate', 'alto', 'stop'])
+    return has_name and has_stop
+
+def wake_detected_vosk(text):
+    t = norm(text)
+    compact = ''.join(ch for ch in t if ch.isalnum())
+    variants = ['oye jarvis','oye llaves','oye llave']
+    if any(v in t for v in variants): return True
+    if 'oye' in t and any(x in t for x in ['jarvis','llave','llaves']): return True
+    return any(v in compact for v in ['oyejarvis','oyellaves','oyellave'])
+
+def inline_command_from_wake(text):
+    t = norm(text)
+    for prefix in ['oye jarvis', 'oye llaves', 'oye llave']:
+        if t.startswith(prefix):
+            cmd = t[len(prefix):].strip(' ,.;:')
+            return cmd if len(cmd) >= 3 else ''
+    return ''
+
+def start_recorder():
+    # No pausamos durante TTS: así “Jarvis, para/detente” puede cortar la voz actual.
+    # La activación normal sigue exigiendo wake word para evitar falsos positivos.
+    _ = SPEAKING_LOCK.exists()
+    if os.path.exists(AMIXER):
+        subprocess.run([AMIXER, '-q', 'set', 'Capture', '30%', 'cap'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return subprocess.Popen([ARECORD, '-q', '-f', 'S16_LE', '-r', '16000', '-c', '1', '-t', 'raw'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+def stop_recorder(proc):
+    if not proc: return
+    try:
+        proc.terminate(); proc.wait(timeout=1.5)
+    except Exception:
+        try: proc.kill()
+        except Exception: pass
+
+def trigger(reason, proc, vosk_model, wake_model, stop_cmd=False, inline_text=''):
+    if inline_text:
+        print(f'Activado por: {reason} | comando inline: {inline_text}', flush=True)
+    else:
+        print(f'Activado por: {reason}', flush=True)
+    stop_recorder(proc)
+    try:
+        if stop_cmd and os.path.exists(JARVIS_STOP):
+            subprocess.run([JARVIS_STOP], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        else:
+            env = os.environ.copy()
+            if inline_text:
+                env['JARVIS_PREFILLED_TEXT'] = inline_text
+            subprocess.run([JARVIS_VOZ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=240, env=env)
+    except subprocess.TimeoutExpired:
+        print('jarvis-stop timeout' if stop_cmd else 'jarvis-voz timeout', flush=True)
+    except Exception as exc:
+        print(f'Error ejecutando {"jarvis-stop" if stop_cmd else "jarvis-voz"}: {exc}', flush=True)
+    if wake_model:
+        try: wake_model.reset()
+        except Exception: pass
+    time.sleep(0.4)
+    return start_recorder(), new_vosk_recognizer(vosk_model)
+
+if not VOSK_MODEL_DIR.exists():
+    print(f'Modelo Vosk no encontrado: {VOSK_MODEL_DIR}', file=sys.stderr); sys.exit(1)
+
+vosk_model = VoskModel(str(VOSK_MODEL_DIR))
+rec = new_vosk_recognizer(vosk_model)
+wake_model = None
+if OPENWAKEWORD_AVAILABLE:
+    try:
+        root = Path(openwakeword.__file__).parent
+        hey_jarvis = root / 'resources' / 'models' / 'hey_jarvis_v0.1.onnx'
+        wake_model = WakeModel(wakeword_model_paths=[str(hey_jarvis)], enable_speex_noise_suppression=False)
+        print('OpenWakeWord activo: hey_jarvis', flush=True)
+    except Exception as exc:
+        print(f'OpenWakeWord no disponible, usando Vosk: {exc}', flush=True)
+        wake_model = None
+
+print('Jarvis escucha activo. Di: oye Jarvis', flush=True)
+proc = start_recorder()
+last_trigger = 0
+try:
+    while running:
+        data = proc.stdout.read(2560) if proc and proc.stdout else b''  # 1280 samples = 80 ms
+        if not data:
+            time.sleep(0.03)
+            if proc and proc.poll() is not None:
+                proc = start_recorder()
+            continue
+
+        should_trigger = False
+        stop_cmd = False
+        reason = ''
+        inline_text = ''
+
+        # Vosk se revisa primero para que “Jarvis, para/cállate” tenga prioridad
+        # incluso si OpenWakeWord también detecta el nombre mientras Jarvis habla.
+        texts = []
+        if rec.AcceptWaveform(data):
+            try: texts.append(json.loads(rec.Result()).get('text', ''))
+            except Exception: pass
+        else:
+            try: texts.append(json.loads(rec.PartialResult()).get('partial', ''))
+            except Exception: pass
+        for text in texts:
+            if not text: continue
+            if text not in {'[unk]', ''}:
+                print(f'Oído: {text}', flush=True)
+            if stop_detected_vosk(text):
+                should_trigger = True
+                stop_cmd = True
+                reason = f'stop: {text}'
+                break
+            if wake_detected_vosk(text):
+                should_trigger = True
+                reason = text
+                inline_text = inline_command_from_wake(text)
+                break
+
+        # Detector dedicado: rápido y más fiable con “Jarvis”.
+        if not should_trigger and wake_model is not None:
+            try:
+                audio = np.frombuffer(data, dtype=np.int16)
+                pred = wake_model.predict(audio)
+                score = max(float(v) for v in pred.values()) if pred else 0.0
+                if score >= OPENWAKEWORD_THRESHOLD:
+                    should_trigger = True
+                    reason = f'openwakeword score={score:.2f}'
+            except Exception as exc:
+                print(f'openwakeword error: {exc}', flush=True)
+                wake_model = None
+
+        if should_trigger and time.time() - last_trigger > 4:
+            last_trigger = time.time()
+            proc, rec = trigger(reason, proc, vosk_model, wake_model, stop_cmd=stop_cmd, inline_text=inline_text)
+finally:
+    stop_recorder(proc)

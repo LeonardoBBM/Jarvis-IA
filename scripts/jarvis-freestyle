@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+import argparse, asyncio, base64, json, os, ssl, sys, time, urllib.parse
+from pathlib import Path
+
+import requests
+import websockets
+
+CONFIG_DIR = Path.home() / '.config' / 'jarvis'
+CONFIG_FILE = CONFIG_DIR / 'freestyle.json'
+DEFAULT_CONFIG = {
+    'name': 'The Freestyle Leo',
+    'ip': '192.168.1.194',
+    'port': 8001,
+    'token': '',
+}
+APP_IDS = {
+    'youtube': '111299001912',
+    'netflix': '11101200001',
+    'prime': '3201512006785',
+    'prime video': '3201512006785',
+    'disney': '3201901017640',
+    'disney+': '3201901017640',
+}
+KEYS = {
+    'power': 'KEY_POWER',
+    'off': 'KEY_POWER',
+    'apagar': 'KEY_POWER',
+    'home': 'KEY_HOME',
+    'inicio': 'KEY_HOME',
+    'back': 'KEY_RETURN',
+    'atras': 'KEY_RETURN',
+    'atrás': 'KEY_RETURN',
+    'enter': 'KEY_ENTER',
+    'ok': 'KEY_ENTER',
+    'up': 'KEY_UP',
+    'arriba': 'KEY_UP',
+    'down': 'KEY_DOWN',
+    'abajo': 'KEY_DOWN',
+    'left': 'KEY_LEFT',
+    'izquierda': 'KEY_LEFT',
+    'right': 'KEY_RIGHT',
+    'derecha': 'KEY_RIGHT',
+    'volup': 'KEY_VOLUP',
+    'subir-volumen': 'KEY_VOLUP',
+    'voldown': 'KEY_VOLDOWN',
+    'bajar-volumen': 'KEY_VOLDOWN',
+    'mute': 'KEY_MUTE',
+    'silencio': 'KEY_MUTE',
+    'play': 'KEY_PLAY',
+    'pause': 'KEY_PAUSE',
+    'pausa': 'KEY_PAUSE',
+}
+
+def load_config():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text())
+        except Exception:
+            data = {}
+    else:
+        data = {}
+    cfg = {**DEFAULT_CONFIG, **data}
+    save_config(cfg)
+    return cfg
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    os.chmod(tmp, 0o600)
+    tmp.replace(CONFIG_FILE)
+
+def api_info(cfg):
+    url = f"http://{cfg['ip']}:8001/api/v2/"
+    r = requests.get(url, timeout=3)
+    r.raise_for_status()
+    return r.json()
+
+def ws_url(cfg, secure=False):
+    name = base64.b64encode(b'Jarvis').decode()
+    port = 8002 if secure else int(cfg.get('port') or 8001)
+    scheme = 'wss' if secure else 'ws'
+    qs = {'name': name}
+    if cfg.get('token'):
+        qs['token'] = cfg['token']
+    return f"{scheme}://{cfg['ip']}:{port}/api/v2/channels/samsung.remote.control?{urllib.parse.urlencode(qs)}"
+
+async def connect(cfg, secure=None):
+    if secure is None:
+        secure = bool(cfg.get('secure')) or int(cfg.get('port') or 8001) == 8002
+    ssl_ctx = None
+    if secure:
+        ssl_ctx = ssl._create_unverified_context()
+    return await websockets.connect(ws_url(cfg, secure), ssl=ssl_ctx, open_timeout=8, close_timeout=2)
+
+async def receive_initial(ws, cfg, timeout=8):
+    end = time.time() + timeout
+    last = None
+    while time.time() < end:
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=1.5)
+        except asyncio.TimeoutError:
+            continue
+        except websockets.exceptions.ConnectionClosed:
+            return {'event': 'connection.closed', 'last': last}
+        last = raw
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            continue
+        token = msg.get('data', {}).get('token') or msg.get('token')
+        if token and token != cfg.get('token'):
+            cfg['token'] = token
+            save_config(cfg)
+            print('Token guardado.')
+        event = msg.get('event', '')
+        if event:
+            print(f'Evento: {event}')
+        if event in {'ms.channel.ready', 'ms.channel.connect', 'ms.channel.clientConnect'}:
+            return msg
+        if event in {'ms.channel.unauthorized'}:
+            return msg
+    if last:
+        print(f'Último mensaje: {last}')
+    return None
+
+async def send_key(cfg, key, times=1):
+    async with await connect(cfg) as ws:
+        await receive_initial(ws, cfg)
+        for _ in range(times):
+            payload = {
+                'method': 'ms.remote.control',
+                'params': {
+                    'Cmd': 'Click',
+                    'DataOfCmd': key,
+                    'Option': 'false',
+                    'TypeOfRemote': 'SendRemoteKey',
+                }
+            }
+            await ws.send(json.dumps(payload))
+            await asyncio.sleep(0.18)
+    print(f'Enviado: {key}')
+
+async def pair(cfg):
+    print('Conectando. Si el proyector pide permiso, acepta a Jarvis.')
+    for secure in (False, True):
+        try:
+            async with await connect(cfg, secure=secure) as ws:
+                print(f'Canal: {"wss/8002" if secure else "ws/8001"}')
+                msg = await receive_initial(ws, cfg, timeout=20)
+                event = (msg or {}).get('event', '')
+                if event == 'ms.channel.unauthorized':
+                    print('El proyector rechazó o aún no autorizó a Jarvis. Revisa la pantalla y acepta el permiso si aparece.')
+                    continue
+                if msg:
+                    print('Emparejamiento/conexión lista.')
+                    return
+        except Exception as exc:
+            print(f'Canal {"wss/8002" if secure else "ws/8001"} falló: {exc}')
+    print('No quedó emparejado todavía. Puede que tengas que borrar permisos previos o aceptar manualmente en el proyector.')
+
+async def launch_app_ws(cfg, app_id):
+    async with await connect(cfg) as ws:
+        await receive_initial(ws, cfg)
+        payload = {
+            'method': 'ms.channel.emit',
+            'params': {
+                'event': 'ed.apps.launch',
+                'to': 'host',
+                'data': {'appId': app_id, 'action_type': 'NATIVE_LAUNCH'}
+            }
+        }
+        await ws.send(json.dumps(payload))
+        await asyncio.sleep(0.5)
+    print(f'Abriendo app {app_id}.')
+
+def launch_app_http(cfg, app_id):
+    # Algunos Tizen aceptan POST directo; si falla, usamos websocket.
+    url = f"http://{cfg['ip']}:8001/api/v2/applications/{app_id}"
+    try:
+        r = requests.post(url, timeout=3)
+        if r.status_code < 400:
+            print(f'Abriendo app {app_id}.')
+            return True
+    except Exception:
+        pass
+    return False
+
+def main():
+    parser = argparse.ArgumentParser(description='Control local para Samsung The Freestyle Leo')
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('info')
+    sub.add_parser('pair')
+    pkey = sub.add_parser('key'); pkey.add_argument('key'); pkey.add_argument('--times', type=int, default=1)
+    popen = sub.add_parser('open'); popen.add_argument('app')
+    sub.add_parser('home')
+    sub.add_parser('off')
+    sub.add_parser('volup')
+    sub.add_parser('voldown')
+    sub.add_parser('mute')
+    args = parser.parse_args()
+    cfg = load_config()
+
+    if args.cmd == 'info':
+        info = api_info(cfg)
+        dev = info.get('device', {})
+        print(json.dumps({k: dev.get(k) for k in ['name','ip','modelName','PowerState','TokenAuthSupport','type']}, indent=2, ensure_ascii=False))
+        return
+    if args.cmd == 'pair':
+        asyncio.run(pair(cfg)); return
+    if args.cmd in {'home','off','volup','voldown','mute'}:
+        key = {'home':'KEY_HOME','off':'KEY_POWER','volup':'KEY_VOLUP','voldown':'KEY_VOLDOWN','mute':'KEY_MUTE'}[args.cmd]
+        asyncio.run(send_key(cfg, key)); return
+    if args.cmd == 'key':
+        key = KEYS.get(args.key.lower(), args.key)
+        if not key.startswith('KEY_'):
+            print(f'No conozco la tecla: {args.key}', file=sys.stderr); sys.exit(2)
+        asyncio.run(send_key(cfg, key, args.times)); return
+    if args.cmd == 'open':
+        app = args.app.lower().strip()
+        app_id = APP_IDS.get(app, args.app)
+        if not launch_app_http(cfg, app_id):
+            asyncio.run(launch_app_ws(cfg, app_id))
+        return
+
+if __name__ == '__main__':
+    main()

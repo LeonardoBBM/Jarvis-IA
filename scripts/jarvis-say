@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TEXT="${*:-}"
+[[ -z "${TEXT// }" ]] && exit 0
+
+EDGE_TTS="/home/leonardo/.local/bin/edge-tts"
+FFMPEG="/home/leonardo/.local/bin/ffmpeg"
+APLAY="/usr/bin/aplay"
+SPD_SAY="/usr/bin/spd-say"
+WORKDIR="${XDG_RUNTIME_DIR:-/tmp}/jarvis-tts"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/jarvis-voz"
+mkdir -p "$WORKDIR" "$STATE_DIR"
+STAMP="$(date +%Y%m%d-%H%M%S-%N)"
+MP3="$WORKDIR/jarvis-$STAMP.mp3"
+WAV="$WORKDIR/jarvis-$STAMP.wav"
+SPEAKING_LOCK="$STATE_DIR/speaking.lock"
+
+touch "$SPEAKING_LOCK" 2>/dev/null || true
+cleanup() { rm -f "$MP3" "$WAV" "$SPEAKING_LOCK" 2>/dev/null || true; }
+trap cleanup EXIT
+
+if [[ -x "$EDGE_TTS" && -x "$FFMPEG" && -x "$APLAY" ]]; then
+  if "$EDGE_TTS" \
+      --voice es-ES-AlvaroNeural \
+      --rate '+4%' \
+      --pitch '-20Hz' \
+      --text "$TEXT" \
+      --write-media "$MP3" >/dev/null 2>&1; then
+    if "$FFMPEG" -y -hide_banner -loglevel error -i "$MP3" -ar 24000 -ac 1 "$WAV" >/dev/null 2>&1; then
+      "$APLAY" -q "$WAV" 2>/dev/null && exit 0
+    fi
+  fi
+fi
+
+# Fallback, solo si falla la voz Microsoft.
+if [[ -x "$SPD_SAY" ]]; then
+  "$SPD_SAY" -l es -r 5 -p -25 "$TEXT" >/dev/null 2>&1 || true
+fi

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/jarvis-voz"
+TTS_DIR="${XDG_RUNTIME_DIR:-/tmp}/jarvis-tts"
+OVERLAY="/home/leonardo/.local/bin/jarvis-overlay"
+mkdir -p "$STATE_DIR" "$TTS_DIR"
+
+# Cortar voz/procesamiento actual de Jarvis. Patrones específicos para no matar audio normal del sistema.
+touch "$STATE_DIR/cancel.flag" 2>/dev/null || true
+pkill -f '/home/leonardo/.local/bin/jarvis-say' 2>/dev/null || true
+pkill -f '/home/leonardo/.local/bin/edge-tts' 2>/dev/null || true
+pkill -f 'aplay -q .*/jarvis-.*\.wav' 2>/dev/null || true
+pkill -f 'spd-say .*' 2>/dev/null || true
+# Si Jarvis estaba esperando una respuesta del agente por voz, córtala también.
+pkill -f '/home/leonardo/.npm-global/bin/openclaw agent --agent main' 2>/dev/null || true
+command -v spd-say >/dev/null 2>&1 && spd-say -S >/dev/null 2>&1 || true
+
+rm -f "$STATE_DIR/speaking.lock" 2>/dev/null || true
+
+# Limpiar estado visual si existe overlay.
+if [[ -x "$OVERLAY" ]]; then
+  "$OVERLAY" --state reply "Cancelado." >/dev/null 2>&1 || true
+fi
+
+echo "Cancelado."

@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE="${JARVIS_OVERLAY_STATE:-reply}"
+DURATION_MS="${JARVIS_OVERLAY_MS:-2800}"
+
+if [[ "${1:-}" == "--state" ]]; then
+  STATE="${2:-reply}"
+  shift 2 || true
+fi
+if [[ "${1:-}" == "--duration" ]]; then
+  DURATION_MS="${2:-2800}"
+  shift 2 || true
+fi
+
+MSG="${*:-Jarvis}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/jarvis-voz"
+PIDFILE="$RUNTIME_DIR/overlay.pid"
+STATEFILE="$RUNTIME_DIR/overlay-state.json"
+TMPSTATE="$RUNTIME_DIR/overlay-state.tmp"
+mkdir -p "$RUNTIME_DIR"
+
+python3 - "$STATEFILE" "$TMPSTATE" "$STATE" "$DURATION_MS" "$MSG" <<'PY'
+import json, os, sys, time
+statefile, tmpstate, state, duration_ms, msg = sys.argv[1:6]
+# Escuchando y procesando quedan continuos hasta el siguiente estado.
+# Respuesta/error desaparecen después del tiempo indicado, pero no mientras Jarvis esté hablando.
+expires_at = 0 if state.lower() in {'listening', 'processing'} else time.time() + max(int(duration_ms), 700) / 1000
+payload = {'state': state.lower(), 'msg': msg, 'updated_at': time.time(), 'expires_at': expires_at}
+with open(tmpstate, 'w', encoding='utf-8') as f:
+    json.dump(payload, f, ensure_ascii=False)
+os.replace(tmpstate, statefile)
+PY
+
+running=""
+if [[ -s "$PIDFILE" ]]; then
+  old_pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [[ -n "${old_pid:-}" ]] && kill -0 "$old_pid" 2>/dev/null; then
+    running="yes"
+  fi
+fi
+
+if [[ -z "$running" ]]; then
+python3 - "$STATEFILE" "$PIDFILE" "$RUNTIME_DIR" <<'PY' >/dev/null 2>"$RUNTIME_DIR/overlay-error.log" &
+import json, math, os, sys, time, warnings
+from pathlib import Path
+import cairo
+
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+statefile = Path(sys.argv[1])
+pidfile = Path(sys.argv[2])
+runtime_dir = Path(sys.argv[3])
+speaking_lock = runtime_dir / 'speaking.lock'
+
+import gi
+gi.require_foreign('cairo')
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GLib
+
+PROFILES = {
+    'listening':  {'speed': 0.045, 'pulse': 2.6, 'sweep': 1.6, 'glow': 0.72, 'rgb': (0.18, 0.95, 1.00)},
+    'processing': {'speed': 0.105, 'pulse': 4.8, 'sweep': 4.2, 'glow': 0.98, 'rgb': (0.00, 0.78, 1.00)},
+    'reply':      {'speed': 0.065, 'pulse': 3.6, 'sweep': 2.8, 'glow': 0.88, 'rgb': (0.46, 1.00, 1.00)},
+    'error':      {'speed': 0.075, 'pulse': 5.4, 'sweep': 3.2, 'glow': 0.95, 'rgb': (1.00, 0.33, 0.22)},
+}
+DEFAULT_STATE = {'state': 'reply', 'msg': '', 'updated_at': time.time(), 'expires_at': time.time() + 2.8}
+MAX_STICKY_SECONDS = 18
+MAX_PROCESSING_SECONDS = 180
+
+def read_state():
+    try:
+        data = json.loads(statefile.read_text(encoding='utf-8'))
+        st = str(data.get('state', 'reply')).lower()
+        if st not in PROFILES:
+            st = 'reply'
+        data['state'] = st
+        data['expires_at'] = float(data.get('expires_at') or 0)
+        return data
+    except Exception:
+        return DEFAULT_STATE
+
+class RingCanvas(Gtk.DrawingArea):
+    def __init__(self):
+        super().__init__()
+        self.phase = 0.0
+        self.profile = PROFILES['reply']
+        self.set_size_request(420, 420)
+        self.connect('draw', self.on_draw)
+        GLib.timeout_add(24, self.tick)
+
+    def tick(self):
+        data = read_state()
+        self.profile = PROFILES[data['state']]
+        now = time.time()
+        # Failsafe: si listening/processing se queda sin actualización, cerrar para no quedar atorado.
+        if not data.get('expires_at', 0):
+            age = now - float(data.get('updated_at') or now)
+            sticky_limit = MAX_PROCESSING_SECONDS if data.get('state') == 'processing' else MAX_STICKY_SECONDS
+            if age > sticky_limit and not speaking_lock.exists():
+                Gtk.main_quit()
+                return False
+        # Si ya terminó respuesta/error y no está hablando, cerramos el HUD.
+        if data.get('expires_at', 0) and now > data['expires_at'] and not speaking_lock.exists():
+            Gtk.main_quit()
+            return False
+        self.phase += self.profile['speed']
+        self.queue_draw()
+        return True
+
+    def color(self, cr, alpha=1.0, boost=1.0):
+        r, g, b = self.profile['rgb']
+        cr.set_source_rgba(min(r * boost, 1), min(g * boost, 1), min(b * boost, 1), alpha)
+
+    def arc(self, cr, cx, cy, r, start, length, alpha, width):
+        cr.set_line_width(width)
+        cr.set_line_cap(1)
+        self.color(cr, alpha)
+        cr.arc(cx, cy, r, start, start + length)
+        cr.stroke()
+
+    def full_ring(self, cr, cx, cy, r, alpha, width):
+        cr.set_line_width(width)
+        self.color(cr, alpha)
+        cr.arc(cx, cy, r, 0, math.tau)
+        cr.stroke()
+
+    def on_draw(self, area, cr):
+        w = area.get_allocated_width()
+        h = area.get_allocated_height()
+        cx, cy = w / 2, h / 2
+        p = self.phase
+        profile = self.profile
+        glow = profile['glow']
+
+        cr.set_operator(cairo.OPERATOR_CLEAR)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+
+        cr.set_source_rgba(0.0, 0.025, 0.045, 0.87)
+        cr.arc(cx, cy, 188, 0, math.tau)
+        cr.fill()
+
+        wobble = math.sin(p * profile['pulse'])
+        for r, a, lw in [(193, 0.20, 12), (180, 0.50, 5), (152, 0.32, 3), (121, 0.26, 2), (84, 0.24, 2)]:
+            self.full_ring(cr, cx, cy, r + wobble * 2.4, a * glow, lw)
+
+        rings = [
+            (172, p * 1.15, 0.82, 0.98, 5.0, 5),
+            (158, -p * 1.55, 0.62, 0.78, 3.3, 7),
+            (135, p * 2.10, 0.52, 0.88, 3.0, 8),
+            (106, -p * 2.50, 0.72, 0.72, 2.5, 5),
+            (67, p * 3.10, 0.58, 0.90, 2.4, 4),
+        ]
+        for radius, rot, length, alpha, width, count in rings:
+            for i in range(count):
+                start = rot + i * math.tau / count + (0.20 if i % 2 else 0)
+                self.arc(cr, cx, cy, radius, start, length, alpha * glow, width)
+
+        for i in range(96):
+            ang = i * math.tau / 96 - p * 0.24
+            outer = 198
+            inner = 183 if i % 8 else 169
+            alpha = 0.45 if i % 8 else 0.95
+            cr.set_line_width(1.4 if i % 8 else 2.2)
+            self.color(cr, alpha * glow, 1.15)
+            cr.move_to(cx + math.cos(ang) * inner, cy + math.sin(ang) * inner)
+            cr.line_to(cx + math.cos(ang) * outer, cy + math.sin(ang) * outer)
+            cr.stroke()
+
+        sweep = p * profile['sweep']
+        self.color(cr, 0.32 * glow)
+        cr.move_to(cx, cy)
+        cr.arc(cx, cy, 165, sweep, sweep + 0.52)
+        cr.close_path()
+        cr.fill()
+
+        cr.set_line_width(1.0)
+        self.color(cr, 0.18 * glow)
+        cr.move_to(cx - 140, cy); cr.line_to(cx + 140, cy); cr.stroke()
+        cr.move_to(cx, cy - 140); cr.line_to(cx, cy + 140); cr.stroke()
+
+        pulse = (math.sin(p * profile['pulse']) + 1) * 0.5
+        self.color(cr, 0.22 * glow)
+        cr.arc(cx, cy, 53 + pulse * 12, 0, math.tau)
+        cr.fill()
+        self.full_ring(cr, cx, cy, 59, 0.96 * glow, 2.6)
+        self.color(cr, 1.0, 1.2)
+        cr.arc(cx, cy, 7 + pulse * 2.3, 0, math.tau)
+        cr.fill()
+        return False
+
+class JarvisHud(Gtk.Window):
+    def __init__(self):
+        super().__init__(title='JARVIS HUD')
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+        self.set_accept_focus(False)
+        self.set_app_paintable(True)
+        self.set_default_size(420, 420)
+
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(b'window { background: transparent; } #root { background: transparent; }')
+        Gtk.StyleContext.add_provider_for_screen(screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        overlay = Gtk.Overlay()
+        overlay.set_name('root')
+        self.add(overlay)
+        self.canvas = RingCanvas()
+        overlay.add(self.canvas)
+        self.connect('destroy', Gtk.main_quit)
+
+    def place(self):
+        self.show_all()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() if display else None
+        if monitor:
+            geo = monitor.get_geometry()
+        else:
+            geo = self.get_screen().get_monitor_geometry(self.get_screen().get_primary_monitor())
+        width, height = self.get_size()
+        self.move(geo.x + geo.width - width - 32, geo.y + 48)
+
+try:
+    win = JarvisHud()
+    win.place()
+    Gtk.main()
+finally:
+    try:
+        if pidfile.exists() and pidfile.read_text().strip() == str(os.getpid()):
+            pidfile.unlink()
+    except Exception:
+        pass
+PY
+
+echo $! > "$PIDFILE"
+fi
+exit 0
